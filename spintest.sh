@@ -11,7 +11,7 @@ VERSION="2020-06-17"
 
 #################  LOG SETTINGS ################
 # Create logfile and sends all stdout and stderr to the log, as well as to the console.
-LOG=/mnt/Ark/Jim/spintest.log  # Change to your desired log location/name
+LOG=/tmp/spintest.log
 exec > >(tee -i $LOG) 2>&1
 
 #################  IPMITOOL SETTING ################
