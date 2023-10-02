@@ -1,7 +1,7 @@
 #!/usr/local/bin/bash
 
 # spinpid2.sh for dual fan zones.
-VERSION="2020-06-17"
+VERSION="2020-08-20"
 # Run as superuser. See notes at end.
 
 ##############################################
@@ -119,8 +119,8 @@ function CPU_check_adjust {
    adjust_fans $ZONE_CPU $DUTY_CPU $DUTY_CPU_LAST
 
    # Use this short CPU cycle to also allow PER fans to come down 
-   # faster after high demand or if 100% at startup.
-   # Adjust DUTY_DRIVE if it will go down (PD<0) and drives are very cool.
+   # if PD < 0 and drives are at least 1 C below setpoint
+   # (e.g, after high demand or if 100% at startup).
    # With multiple CPU cycles and no new drive temps, this will
    # drive fans to DUTY_PER_MIN, but that's ok if drives are that cool.
    # However, this is experimental.
@@ -152,11 +152,8 @@ function CPU_check_adjust {
 # Call adjust_fans.
 ##############################################
 function DRIVES_check_adjust {
-   echo  # start new line
-   # print time on each line
-   TIME=$(date "+%H:%M:%S"); echo -n "$TIME  "
    Tmax=0; Tsum=0  # initialize drive temps for new loop through drives
-   i=0  # initialize count of spinning drives
+   i=0             # initialize count of spinning drives
    while read -r LINE ; do
       get_disk_name
       /usr/local/sbin/smartctl -a -n standby "/dev/$DEVID" > /var/tempfile
@@ -280,10 +277,10 @@ function mismatch_test {
 	MISMATCH=0; MISMATCH_CPU=0; MISMATCH_PER=0
 
 	# ${!RPM_*} gets updated value of the variable RPM_* points to
-	#if [[ (DUTY_CPU -ge 95 && ${!RPM_CPU} -lt RPM_CPU_MAX) || (DUTY_CPU -lt 25 && ${!RPM_CPU} -gt RPM_CPU_30) ]] ; then
-	#	MISMATCH=1; MISMATCH_CPU=1
-	#	printf "\n%s\n" "Mismatch between CPU Duty and RPMs -- DUTY_CPU=$DUTY_CPU; RPM_CPU=${!RPM_CPU}"
-	#fi
+	if [[ (DUTY_CPU -ge 95 && ${!RPM_CPU} -lt RPM_CPU_MAX) || (DUTY_CPU -lt 25 && ${!RPM_CPU} -gt RPM_CPU_30) ]] ; then
+		MISMATCH=1; MISMATCH_CPU=1
+		printf "\n%s\n" "Mismatch between CPU Duty and RPMs -- DUTY_CPU=$DUTY_CPU; RPM_CPU=${!RPM_CPU}"
+	fi
 	if [[ (DUTY_PER -ge 95 && ${!RPM_PER} -lt RPM_PER_MAX) || (DUTY_PER -lt 25 && ${!RPM_PER} -gt RPM_PER_30) ]] ; then
 		MISMATCH=1; MISMATCH_PER=1
 		printf "\n%s\n" "Mismatch between PER Duty and RPMs -- DUTY_PER=$DUTY_PER; RPM_PER=${!RPM_PER}"
@@ -296,12 +293,12 @@ function mismatch_test {
 # after BMC reset
 ##############################################
 function force_set_fans {
-	#if [ $MISMATCH_CPU == 1 ]; then
-	#	FIRST_TIME=1  # forces adjust_fans to do it
-	#	adjust_fans $ZONE_CPU $DUTY_CPU $DUTY_CPU_LAST
-	#	echo "Attempting to fix CPU mismatch  "
-	#	sleep 5
-	#fi
+	if [ $MISMATCH_CPU == 1 ]; then
+		FIRST_TIME=1  # forces adjust_fans to do it
+		adjust_fans $ZONE_CPU $DUTY_CPU $DUTY_CPU_LAST
+		echo "Attempting to fix CPU mismatch  "
+		sleep 5
+	fi
 	if [ $MISMATCH_PER == 1 ]; then
 		FIRST_TIME=1
 		adjust_fans $ZONE_PER $DUTY_PER $DUTY_PER_LAST
@@ -359,7 +356,6 @@ else
 	printf "Getting CPU temperature via ipmitool (sysctl not available) \n"
 fi
 
-DRIVE_SLEEP=$(expr $DRIVE_T \* 60)
 CPU_LOOPS=$( bc <<< "$DRIVE_T * 60 / $CPU_T" )  # Number of whole CPU loops per drive loop
 I=0; ERRc=0  # Initialize errors to 0
 FIRST_TIME=1
@@ -394,12 +390,12 @@ read_fan_data
 # If mode not Full, set it to avoid BMC changing duty cycle
 # Need to wait a tick or it may not get next command
 # "echo -n" to avoid annoying newline generated in log
-#if [[ MODE -ne 1 ]]; then
-#   echo -n "$($IPMITOOL raw 0x30 0x45 1 1)"
-#   sleep 1
-#fi
+if [[ MODE -ne 1 ]]; then
+   echo -n "$($IPMITOOL raw 0x30 0x45 1 1)"
+   sleep 1
+fi
 
-# Need to start drive duty at a reasonable value if fans are
+# Need to start fan duty at a reasonable value if fans are
 # going fast or we didn't read DUTY_* in read_fan_data
 # (second test is TRUE if DUTY_* is unset). 
 if [[ ${!RPM_PER} -ge RPM_PER_MAX || -z ${DUTY_PER+x} ]]; then
@@ -454,12 +450,25 @@ while true ; do
       print_header;
    fi
 
-# Test loop for BMC reset.  Exit loop if no
-# mismatch found between duty and rpm, or
-# after 2 attempts to fix lead to bmc reset
-# and a third attempt to fix.
+#
+# Main stuff
+#
+	echo                                         # start new line
+	TIME=$(date "+%H:%M:%S"); echo -n "$TIME  "  # print time on each line
 
-	ATTEMPTS=0  # Attempts to fix duties if rpms are mismatched
+	DRIVES_check_adjust                          # prints drive data also
+
+	sleep 5  # Let fans equilibrate to duty before reading them
+	read_fan_data
+
+
+   printf "%7s %6s %6.6s %4s %-7s %3d %3d %6s %5s %5s %5s %5s" "${ERRc:----}" "${P:----}" "${D:----}" "$CPU_TEMP" $MODEt $DUTY_CPU $DUTY_PER "${FANA:----}" "${FAN1:----}" "${FAN2:----}" "${FAN3:----}" "${FAN4:----}"
+
+# Test loop for BMC reset.  Exit loop if no mismatch found between duty and rpm,
+# or after 2 attempts to fix lead to bmc reset and a third attempt to fix.
+# This should happen after reading fans so CPU loops don't result in false mismatch.
+
+	ATTEMPTS=0  # Number of attempts to fix duties
 	mismatch_test
 	
 	while true; do
@@ -489,23 +498,13 @@ while true ; do
 		fi
 	done
 
-#
-# Main stuff
-#
-	DRIVES_check_adjust
-	sleep 5  # Let fans equilibrate to duty before reading them
-	read_fan_data
 
-
-   printf "%7s %6s %6.6s %4s %-7s %3d %3d %6s %5s %5s %5s %5s" "${ERRc:----}" "${P:----}" "${D:----}" "$CPU_TEMP" $MODEt $DUTY_CPU $DUTY_PER "${FANA:----}" "${FAN1:----}" "${FAN2:----}" "${FAN3:----}" "${FAN4:----}"
-
-	sleep $DRIVE_SLEEP
 	# CPU loop
-	#i=0
-	#while [ $i -lt "$CPU_LOOPS" ]; do
-	#	CPU_check_adjust
-	#	let i=i+1
-	#done
+	i=0
+	while [ $i -lt "$CPU_LOOPS" ]; do
+		CPU_check_adjust
+		let i=i+1
+	done
 done
 
 # For SuperMicro motherboards with dual fan zones.  
@@ -551,12 +550,6 @@ done
 #  80        50     1100/1200
 #  90        5A     1200/1300
 # 100        64     1300
-
-# Duty cycle isn't provided reliably by all boards.  Therefore, by
-# default we don't try to read them, and the script just assumes
-# that they are what the script last set.  If you want to try reading them,
-# go to the function read_fan_data and uncomment the first 4 lines,
-# where it reads/converts duty cycles. 
 
 ################
 # Tuning Advice
