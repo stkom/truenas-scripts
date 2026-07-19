@@ -30,9 +30,12 @@ type DriveReading struct {
 }
 
 type smartctlOutput struct {
-	PowerMode string `json:"power_mode"`
-	Smartctl  struct {
-		ExitStatus int `json:"exit_status"`
+	PowerMode *struct {
+		Name string `json:"name"`
+	} `json:"power_mode"`
+	Smartctl struct {
+		ExitStatus int      `json:"exit_status"`
+		Output     []string `json:"output"`
 	} `json:"smartctl"`
 	Temperature struct {
 		Current *float64 `json:"current"`
@@ -40,24 +43,18 @@ type smartctlOutput struct {
 }
 
 type SmartctlClient struct {
-	cfg    CommandConfig
-	runner CommandRunner
+	cfg     CommandConfig
+	command ConfiguredCommand
 }
 
 func NewSmartctlClient(cfg CommandConfig, runner CommandRunner) *SmartctlClient {
-	return &SmartctlClient{cfg: cfg, runner: runner}
+	return &SmartctlClient{cfg: cfg, command: NewConfiguredCommand(cfg, runner)}
 }
 
 func (client *SmartctlClient) ReadTemperature(ctx context.Context, device string) DriveReading {
-	commandCtx, cancel := context.WithTimeout(ctx, client.cfg.Timeout.Duration)
-	defer cancel()
-	args := append(append([]string{}, client.cfg.Args...), "-a", "-j", "-n", "standby", device)
-	result, err := client.runner.Run(commandCtx, client.cfg.Path, args...)
+	result, err := client.command.Run(ctx, "-a", "--json=o", "-n", "standby", device)
 	if err != nil {
-		return failedDrive(device, fmt.Errorf("error running %s: %w", client.cfg.Path, err))
-	}
-	if errors.Is(commandCtx.Err(), context.DeadlineExceeded) {
-		return failedDrive(device, fmt.Errorf("%s timed out after %s", client.cfg.Path, client.cfg.Timeout.Duration))
+		return failedDrive(device, err)
 	}
 
 	var output smartctlOutput
@@ -71,17 +68,17 @@ func (client *SmartctlClient) ReadTemperature(ctx context.Context, device string
 	if exitStatus == 0 && result.ExitCode != 0 {
 		exitStatus = result.ExitCode
 	}
-	if isStandby(output.PowerMode) {
+	if smartctlReportsStandby(output) {
 		return DriveReading{Device: device, State: DriveStandby}
 	}
-	if exitStatus&1 != 0 {
+	if exitStatus&0x03 != 0 {
 		return failedDrive(device, fmt.Errorf("smartctl could not inspect device (status %d)", exitStatus))
 	}
 	if output.Temperature.Current == nil {
 		return failedDrive(device, errors.New("smartctl returned no temperature"))
 	}
 	temperature := *output.Temperature.Current
-	if temperature < -20 || temperature > 150 || math.IsNaN(temperature) {
+	if !validTemperature(temperature) {
 		return failedDrive(device, fmt.Errorf("smartctl returned invalid temperature %.1f", temperature))
 	}
 	reading := DriveReading{Device: device, State: DriveActive, Temperature: temperature}
@@ -95,7 +92,21 @@ func failedDrive(device string, err error) DriveReading {
 	return DriveReading{Device: device, State: DriveFailed, Err: err}
 }
 
-func isStandby(powerMode string) bool {
+func smartctlReportsStandby(output smartctlOutput) bool {
+	if output.PowerMode != nil && isStandbyMode(output.PowerMode.Name) {
+		return true
+	}
+	for _, line := range output.Smartctl.Output {
+		line = strings.ToLower(strings.TrimSpace(line))
+		if (strings.Contains(line, "device is in") || strings.Contains(line, "power mode")) &&
+			(strings.Contains(line, "standby") || strings.Contains(line, "sleep")) {
+			return true
+		}
+	}
+	return false
+}
+
+func isStandbyMode(powerMode string) bool {
 	mode := strings.ToLower(strings.TrimSpace(powerMode))
 	return mode == "standby" || mode == "sleep"
 }
@@ -142,7 +153,7 @@ func ReadHwmonCPUTemperature(root string) (float64, error) {
 				continue
 			}
 			temperature := millidegrees / 1000
-			if temperature >= -20 && temperature <= 150 {
+			if validTemperature(temperature) {
 				temperatures = append(temperatures, temperature)
 			}
 		}
@@ -183,4 +194,13 @@ func maxFloat(values []float64) float64 {
 		}
 	}
 	return maximum
+}
+
+const (
+	minimumValidTemperature = -20
+	maximumValidTemperature = 150
+)
+
+func validTemperature(temperature float64) bool {
+	return temperature >= minimumValidTemperature && temperature <= maximumValidTemperature && !math.IsNaN(temperature)
 }

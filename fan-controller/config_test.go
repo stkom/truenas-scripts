@@ -35,6 +35,25 @@ func TestLoadConfigAppliesDefaultsAndOverrides(t *testing.T) {
 	if cfg.Drives.PollInterval.Duration != 2*time.Minute {
 		t.Errorf("Drives.PollInterval = %v, want 2m", cfg.Drives.PollInterval.Duration)
 	}
+	if cfg.LogMaxSizeMB != 5 || cfg.LogBackups != 2 {
+		t.Errorf("log rotation = %d MB/%d backups, want 5/2", cfg.LogMaxSizeMB, cfg.LogBackups)
+	}
+}
+
+func TestConfigRejectsInvalidLogRotation(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Drives.Devices = []string{"/dev/sda"}
+	cfg.LogMaxSizeMB = 0
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "log_max_size_mb") {
+		t.Fatalf("Validate() error = %v, want log size error", err)
+	}
+
+	cfg = DefaultConfig()
+	cfg.Drives.Devices = []string{"/dev/sda"}
+	cfg.LogBackups = 11
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "log_backups") {
+		t.Fatalf("Validate() error = %v, want backup count error", err)
+	}
 }
 
 func TestLoadConfigRejectsUnknownField(t *testing.T) {

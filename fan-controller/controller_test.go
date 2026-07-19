@@ -1,6 +1,72 @@
 package main
 
-import "testing"
+import (
+	"context"
+	"errors"
+	"io"
+	"log/slog"
+	"testing"
+)
+
+type dutyWrite struct {
+	zone int
+	duty int
+}
+
+type fakeFanHardware struct {
+	mode          int
+	duties        map[int]int
+	rpms          map[string]float64
+	modeWriteErr  error
+	modeReadErr   error
+	dutyReadErr   map[int]error
+	failingDuties map[int]bool
+	modeWrites    []int
+	dutyWrites    []dutyWrite
+}
+
+func newFakeFanHardware() *fakeFanHardware {
+	return &fakeFanHardware{
+		duties:        map[int]int{},
+		rpms:          map[string]float64{},
+		dutyReadErr:   map[int]error{},
+		failingDuties: map[int]bool{},
+	}
+}
+
+func (hardware *fakeFanHardware) GetFanMode(context.Context) (int, error) {
+	return hardware.mode, hardware.modeReadErr
+}
+
+func (hardware *fakeFanHardware) SetFanMode(_ context.Context, mode int) error {
+	hardware.modeWrites = append(hardware.modeWrites, mode)
+	if hardware.modeWriteErr != nil {
+		return hardware.modeWriteErr
+	}
+	hardware.mode = mode
+	return nil
+}
+
+func (hardware *fakeFanHardware) GetZoneDuty(_ context.Context, zone int) (int, error) {
+	return hardware.duties[zone], hardware.dutyReadErr[zone]
+}
+
+func (hardware *fakeFanHardware) SetZoneDuty(_ context.Context, zone, duty int) error {
+	hardware.dutyWrites = append(hardware.dutyWrites, dutyWrite{zone: zone, duty: duty})
+	if hardware.failingDuties[duty] {
+		return errors.New("duty write failed")
+	}
+	hardware.duties[zone] = duty
+	return nil
+}
+
+func (hardware *fakeFanHardware) ReadFanRPM(_ context.Context, sensor string) (float64, error) {
+	return hardware.rpms[sensor], nil
+}
+
+func newTestController(cfg *Config, hardware FanHardware, cpuReader CPUReader, driveReader DriveReader) *Controller {
+	return NewController(cfg, hardware, cpuReader, driveReader, slog.New(slog.NewTextHandler(io.Discard, nil)))
+}
 
 func TestCalculateCPUDuty(t *testing.T) {
 	cfg := DefaultConfig().CPU
@@ -77,5 +143,127 @@ func TestFanRPMMismatch(t *testing.T) {
 				t.Errorf("fanRPMMismatch(%d, %v) = %t, want %t", test.duty, test.rpm, got, test.want)
 			}
 		})
+	}
+}
+
+func TestControllerRestoresModeAndReappliesBothZones(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Drives.Devices = []string{"/dev/sda"}
+	cfg.ModeSettleTime.Duration = 0
+	cfg.ReadDuty = false
+	hardware := newFakeFanHardware()
+	hardware.mode = 0
+	hardware.duties[0] = 100
+	hardware.duties[1] = 100
+	controller := newTestController(&cfg, hardware, nil, nil)
+	controller.cpuZone.duty = 30
+	controller.driveZone.duty = 52
+
+	if err := controller.ensureManualMode(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if hardware.mode != cfg.ManualMode || hardware.duties[0] != 30 || hardware.duties[1] != 52 {
+		t.Errorf("mode/duties = %d/%d/%d, want %d/30/52", hardware.mode, hardware.duties[0], hardware.duties[1], cfg.ManualMode)
+	}
+	if len(hardware.dutyWrites) != 2 {
+		t.Errorf("duty writes = %v, want forced writes for both zones", hardware.dutyWrites)
+	}
+}
+
+func TestControllerModeFailureUsesBothFailureDuties(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Drives.Devices = []string{"/dev/sda"}
+	hardware := newFakeFanHardware()
+	hardware.mode = 0
+	hardware.modeWriteErr = errors.New("mode write failed")
+	controller := newTestController(&cfg, hardware,
+		func(context.Context) (float64, string, error) { return 40, "test", nil },
+		func(context.Context, []string) []DriveReading { return nil },
+	)
+	controller.cpuZone.duty = 30
+	controller.driveZone.duty = 50
+
+	controller.runCPUCycle(context.Background())
+	if controller.cpuZone.duty != 100 || controller.driveZone.duty != 100 {
+		t.Errorf("cached duties = %d/%d, want 100/100", controller.cpuZone.duty, controller.driveZone.duty)
+	}
+	if hardware.duties[0] != 100 || hardware.duties[1] != 100 {
+		t.Errorf("hardware duties = %d/%d, want 100/100", hardware.duties[0], hardware.duties[1])
+	}
+}
+
+func TestControlledZoneCacheChangesOnlyAfterSuccessfulWrite(t *testing.T) {
+	hardware := newFakeFanHardware()
+	hardware.failingDuties[60] = true
+	zone := newControlledZone("test", FanConfig{Zone: 1}, 100, hardware, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	zone.duty = 40
+
+	if _, err := zone.set(context.Background(), 60); err == nil {
+		t.Fatal("set() error is nil")
+	}
+	if zone.duty != 40 {
+		t.Errorf("duty = %d after failed write, want 40", zone.duty)
+	}
+	if _, err := zone.setOrFailSafe(context.Background(), 60); err == nil {
+		t.Fatal("setOrFailSafe() error is nil")
+	}
+	if zone.duty != 100 || hardware.duties[1] != 100 {
+		t.Errorf("failure duty cache/hardware = %d/%d, want 100/100", zone.duty, hardware.duties[1])
+	}
+}
+
+func TestControllerCPUSensorFailureUsesFailureDuty(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Drives.Devices = []string{"/dev/sda"}
+	hardware := newFakeFanHardware()
+	controller := newTestController(&cfg, hardware,
+		func(context.Context) (float64, string, error) { return 0, "", errors.New("sensor failed") },
+		nil,
+	)
+	controller.cpuZone.duty = 30
+
+	if err := controller.updateCPU(context.Background()); err == nil {
+		t.Fatal("updateCPU() error is nil")
+	}
+	if controller.cpuZone.duty != 100 || hardware.duties[0] != 100 {
+		t.Errorf("CPU failure duty cache/hardware = %d/%d, want 100/100", controller.cpuZone.duty, hardware.duties[0])
+	}
+}
+
+func TestControllerReconcileFailureUsesBothFailureDuties(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Drives.Devices = []string{"/dev/sda"}
+	hardware := newFakeFanHardware()
+	hardware.duties[0] = 30
+	hardware.duties[1] = 50
+	hardware.dutyReadErr[0] = errors.New("read failed")
+	controller := newTestController(&cfg, hardware, nil, nil)
+	controller.cpuZone.duty = 30
+	controller.driveZone.duty = 50
+
+	if err := controller.reconcileDuties(context.Background()); err == nil {
+		t.Fatal("reconcileDuties() error is nil")
+	}
+	if controller.cpuZone.duty != 100 || controller.driveZone.duty != 100 {
+		t.Errorf("failure duties = %d/%d, want 100/100", controller.cpuZone.duty, controller.driveZone.duty)
+	}
+}
+
+func TestControlledZoneRPMMismatchUsesFailureDuty(t *testing.T) {
+	hardware := newFakeFanHardware()
+	hardware.rpms["FANA"] = 1000
+	zone := newControlledZone("drive", FanConfig{
+		Zone: 1,
+		RPMMonitor: RPMMonitorConfig{
+			Enabled: true, Sensor: "FANA", RPMAt30: 600, RPMAt100: 1700,
+		},
+	}, 100, hardware, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	zone.duty = 20
+
+	if err := zone.verifyRPM(context.Background(), 0, 0); err == nil {
+		t.Fatal("verifyRPM() error is nil")
+	}
+	if zone.duty != 100 || hardware.duties[1] != 100 {
+		t.Errorf("RPM failure duty cache/hardware = %d/%d, want 100/100", zone.duty, hardware.duties[1])
 	}
 }

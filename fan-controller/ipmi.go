@@ -13,14 +13,14 @@ import (
 var sensorReadingPattern = regexp.MustCompile(`(?i)Sensor Reading\s*:\s*([+-]?[0-9]+(?:\.[0-9]+)?)`)
 
 type IPMIClient struct {
-	cfg    CommandConfig
-	runner CommandRunner
-	log    *slog.Logger
-	dryRun bool
+	cfg     CommandConfig
+	command ConfiguredCommand
+	log     *slog.Logger
+	dryRun  bool
 }
 
 func NewIPMIClient(cfg CommandConfig, runner CommandRunner, logger *slog.Logger, dryRun bool) *IPMIClient {
-	return &IPMIClient{cfg: cfg, runner: runner, log: logger, dryRun: dryRun}
+	return &IPMIClient{cfg: cfg, command: NewConfiguredCommand(cfg, runner), log: logger, dryRun: dryRun}
 }
 
 func (client *IPMIClient) GetFanMode(ctx context.Context) (int, error) {
@@ -102,17 +102,7 @@ func (client *IPMIClient) raw(ctx context.Context, args ...string) ([]byte, erro
 }
 
 func (client *IPMIClient) run(ctx context.Context, args ...string) (CommandResult, error) {
-	commandCtx, cancel := context.WithTimeout(ctx, client.cfg.Timeout.Duration)
-	defer cancel()
-	allArgs := append(append([]string{}, client.cfg.Args...), args...)
-	result, err := client.runner.Run(commandCtx, client.cfg.Path, allArgs...)
-	if err != nil {
-		return result, fmt.Errorf("error running %s: %w", client.cfg.Path, err)
-	}
-	if errors.Is(commandCtx.Err(), context.DeadlineExceeded) {
-		return result, fmt.Errorf("%s timed out after %s", client.cfg.Path, client.cfg.Timeout.Duration)
-	}
-	return result, nil
+	return client.command.Run(ctx, args...)
 }
 
 func parseHexByte(output []byte) (int, error) {

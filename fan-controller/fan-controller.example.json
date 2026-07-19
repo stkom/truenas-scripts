@@ -40,12 +40,12 @@
       }
     },
     "devices": [
-      "/dev/sdb",
-      "/dev/sdc",
-      "/dev/sdd",
-      "/dev/sde",
-      "/dev/sdf",
-      "/dev/sdg"
+      "/dev/disk/by-id/wwn-0x5000cca252f74c91",
+      "/dev/disk/by-id/wwn-0x5000cca252f7447f",
+      "/dev/disk/by-id/wwn-0x5000cca267ef94ab",
+      "/dev/disk/by-id/wwn-0x5000cca252f75aae",
+      "/dev/disk/by-id/wwn-0x5000cca273f0684d",
+      "/dev/disk/by-id/wwn-0x5000cca252f733f7"
     ],
     "poll_interval": "5m",
     "setpoint_c": 36,
@@ -56,6 +56,8 @@
     "failure_duty": 100
   },
   "log_path": "/root/scripts/fan-controller.log",
+  "log_max_size_mb": 5,
+  "log_backups": 2,
   "manual_mode": 1,
   "initial_duty": 50,
   "restore_mode_on_exit": true,

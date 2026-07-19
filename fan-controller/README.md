@@ -11,6 +11,7 @@ Dual-zone Supermicro IPMI fan controller for TrueNAS SCALE. CPU duty follows pac
 - SIGINT/SIGTERM restores the BMC fan mode present at startup when `restore_mode_on_exit` is enabled.
 - `--dry-run` reads hardware but skips all IPMI writes.
 - With `read_duty` enabled, each CPU cycle detects and corrects BMC duty resets. This corresponds to legacy `HOW_DUTY=1`.
+- Each CPU cycle also restores externally changed fan mode, waits for the BMC, then forcibly reapplies both zone duties.
 
 Test this against the exact motherboard and fan wiring before unattended use. Supermicro raw commands are board-specific.
 
@@ -30,7 +31,9 @@ cp fan-controller.example.json fan-controller.json
 ./fan-controller -config fan-controller.json -check
 ```
 
-List every controlled HDD explicitly in `drives.devices`. `smartctl -n standby` avoids waking sleeping drives. CPU temperature uses Linux hwmon first, then the configured IPMI sensor.
+List every controlled HDD explicitly in `drives.devices`, using stable `/dev/disk/by-id/` paths. `smartctl -n standby` avoids waking sleeping drives; both smartctl 7.4 text-backed and 7.5 structured power-mode JSON are supported. CPU temperature uses Linux hwmon first, then the configured IPMI sensor.
+
+File logs rotate before exceeding `log_max_size_mb`. `log_backups` controls how many numbered backups are retained. Unchanged five-second CPU readings are not written at INFO level.
 
 RPM calibration retains the old config values. CPU RPM monitoring defaults off, matching the disabled check in the working shell script. Automatic BMC cold reset is intentionally omitted.
 

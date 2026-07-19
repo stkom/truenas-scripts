@@ -77,6 +77,8 @@ type Config struct {
 	Drives            DriveConfig   `json:"drives"`
 	Safety            SafetyConfig  `json:"safety"`
 	LogPath           string        `json:"log_path"`
+	LogMaxSizeMB      int           `json:"log_max_size_mb"`
+	LogBackups        int           `json:"log_backups"`
 	ManualMode        int           `json:"manual_mode"`
 	InitialDuty       int           `json:"initial_duty"`
 	RestoreModeOnExit bool          `json:"restore_mode_on_exit"`
@@ -121,6 +123,8 @@ func DefaultConfig() Config {
 		},
 		Safety:            SafetyConfig{FailureDuty: 100},
 		LogPath:           "/tmp/fan-controller.log",
+		LogMaxSizeMB:      5,
+		LogBackups:        2,
 		ManualMode:        1,
 		InitialDuty:       50,
 		RestoreModeOnExit: true,
@@ -217,6 +221,12 @@ func (cfg *Config) Validate() error {
 	}
 	if cfg.Safety.FailureDuty < cfg.CPU.Fan.MaxDuty || cfg.Safety.FailureDuty < cfg.Drives.Fan.MaxDuty {
 		return errors.New("safety.failure_duty cannot be below a configured maximum duty")
+	}
+	if cfg.LogMaxSizeMB <= 0 || cfg.LogMaxSizeMB > 1024 {
+		return errors.New("log_max_size_mb must be between 1 and 1024")
+	}
+	if cfg.LogBackups < 0 || cfg.LogBackups > 10 {
+		return errors.New("log_backups must be between 0 and 10")
 	}
 	if cfg.InitialDuty < 1 || cfg.InitialDuty > 100 {
 		return errors.New("initial_duty must be between 1 and 100")
