@@ -504,7 +504,7 @@ func waitFor(ctx context.Context, duration time.Duration) error {
 
 func calculateCPUDuty(temperature float64, cfg CPUConfig) int {
 	demand := float64(cfg.Fan.MinDuty) + (temperature-cfg.ReferenceC)*cfg.DutyPerDegree
-	return clampDuty(int(math.Ceil(demand)), cfg.Fan)
+	return clampFloatDuty(math.Ceil(demand), cfg.Fan)
 }
 
 func calculateDriveDuty(current int, previousError float64, readings []DriveReading, cfg DriveConfig, failureDuty int) DriveControlResult {
@@ -538,9 +538,22 @@ func calculateDriveDuty(current int, previousError float64, readings []DriveRead
 	result.Proportional = cfg.Kp * result.Error
 	minutes := cfg.PollInterval.Duration.Minutes()
 	result.Derivative = cfg.Kd * (result.Error - previousError) / minutes
-	change := int(math.Round(result.Proportional + result.Derivative))
-	result.Duty = clampDuty(current+change, cfg.Fan)
+	demand := float64(current) + result.Proportional + result.Derivative
+	result.Duty = clampFloatDuty(math.Round(demand), cfg.Fan)
 	return result
+}
+
+func clampFloatDuty(value float64, cfg FanConfig) int {
+	if math.IsNaN(value) {
+		return cfg.MaxDuty
+	}
+	if value <= float64(cfg.MinDuty) {
+		return cfg.MinDuty
+	}
+	if value >= float64(cfg.MaxDuty) {
+		return cfg.MaxDuty
+	}
+	return int(value)
 }
 
 func clampDuty(value int, cfg FanConfig) int {

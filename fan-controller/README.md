@@ -36,6 +36,8 @@ List every controlled HDD explicitly in `drives.devices`, using stable `/dev/dis
 
 `cpu.minimum_temperature_c` and `drives.minimum_temperature_c` reject implausibly low numeric readings. Both default to 5°C.
 
+Reference/setpoint temperatures must stay within the configured sensor range. Control gains are capped at 100; out-of-range values fail `-check`.
+
 File logs rotate before exceeding `log_max_size_mb`. `log_backups` controls how many numbered backups are retained. Unchanged five-second CPU readings are not written at INFO level.
 
 RPM calibration retains the old config values. CPU RPM monitoring defaults off, matching the disabled check in the working shell script. Automatic BMC cold reset is intentionally omitted.

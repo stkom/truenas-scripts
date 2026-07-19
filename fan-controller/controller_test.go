@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"math"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -100,6 +101,26 @@ func TestCalculateCPUDuty(t *testing.T) {
 				t.Errorf("calculateCPUDuty(%v) = %d, want %d", test.temperature, got, test.want)
 			}
 		})
+	}
+}
+
+func TestDutyCalculationsSaturateBeforeIntegerConversion(t *testing.T) {
+	cpuCfg := DefaultConfig().CPU
+	cpuCfg.DutyPerDegree = math.MaxFloat64
+	if got := calculateCPUDuty(cpuCfg.ReferenceC+1, cpuCfg); got != cpuCfg.Fan.MaxDuty {
+		t.Errorf("CPU duty = %d, want maximum %d", got, cpuCfg.Fan.MaxDuty)
+	}
+
+	driveCfg := DefaultConfig().Drives
+	driveCfg.Kp = math.MaxFloat64
+	driveCfg.Kd = 0
+	result := calculateDriveDuty(50, 0, []DriveReading{{State: DriveActive, Temperature: driveCfg.SetpointC + 1}}, driveCfg, 100)
+	if result.Duty != driveCfg.Fan.MaxDuty {
+		t.Errorf("drive duty = %d, want maximum %d", result.Duty, driveCfg.Fan.MaxDuty)
+	}
+
+	if got := clampFloatDuty(math.NaN(), cpuCfg.Fan); got != cpuCfg.Fan.MaxDuty {
+		t.Errorf("NaN duty = %d, want safe maximum %d", got, cpuCfg.Fan.MaxDuty)
 	}
 }
 

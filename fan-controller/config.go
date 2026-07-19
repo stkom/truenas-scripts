@@ -11,6 +11,8 @@ import (
 	"time"
 )
 
+const maximumControlGain = 100.0
+
 type Duration struct {
 	time.Duration
 }
@@ -193,11 +195,14 @@ func (cfg *Config) Validate() error {
 	if cfg.CPU.PollInterval.Duration <= 0 {
 		return errors.New("cpu.poll_interval must be positive")
 	}
-	if cfg.CPU.DutyPerDegree <= 0 {
-		return errors.New("cpu.duty_per_degree must be positive")
-	}
 	if err := validateMinimumTemperature("cpu.minimum_temperature_c", cfg.CPU.MinimumTemperatureC); err != nil {
 		return err
+	}
+	if err := validateControlTemperature("cpu.reference_c", cfg.CPU.ReferenceC, cfg.CPU.MinimumTemperatureC); err != nil {
+		return err
+	}
+	if !(cfg.CPU.DutyPerDegree > 0 && cfg.CPU.DutyPerDegree <= maximumControlGain) {
+		return fmt.Errorf("cpu.duty_per_degree must be above 0 and at most %.0f", maximumControlGain)
 	}
 	if strings.TrimSpace(cfg.CPU.HwmonRoot) == "" && strings.TrimSpace(cfg.CPU.IPMISensor) == "" {
 		return errors.New("cpu requires hwmon_root or ipmi_sensor")
@@ -205,11 +210,17 @@ func (cfg *Config) Validate() error {
 	if cfg.Drives.PollInterval.Duration <= 0 {
 		return errors.New("drives.poll_interval must be positive")
 	}
-	if cfg.Drives.Kp < 0 || cfg.Drives.Kd < 0 {
-		return errors.New("drives.kp and drives.kd cannot be negative")
-	}
 	if err := validateMinimumTemperature("drives.minimum_temperature_c", cfg.Drives.MinimumTemperatureC); err != nil {
 		return err
+	}
+	if err := validateControlTemperature("drives.setpoint_c", cfg.Drives.SetpointC, cfg.Drives.MinimumTemperatureC); err != nil {
+		return err
+	}
+	if !(cfg.Drives.Kp >= 0 && cfg.Drives.Kp <= maximumControlGain) {
+		return fmt.Errorf("drives.kp must be between 0 and %.0f", maximumControlGain)
+	}
+	if !(cfg.Drives.Kd >= 0 && cfg.Drives.Kd <= maximumControlGain) {
+		return fmt.Errorf("drives.kd must be between 0 and %.0f", maximumControlGain)
 	}
 	if len(cfg.Drives.Devices) == 0 {
 		return errors.New("drives.devices cannot be empty")
@@ -269,6 +280,13 @@ func validateCommand(name string, cfg CommandConfig) error {
 func validateMinimumTemperature(name string, temperature float64) error {
 	if temperature < absoluteMinimumTemperature || temperature >= maximumValidTemperature {
 		return fmt.Errorf("%s must be at least %d and below %d", name, absoluteMinimumTemperature, maximumValidTemperature)
+	}
+	return nil
+}
+
+func validateControlTemperature(name string, temperature, minimum float64) error {
+	if !validTemperature(temperature, minimum) {
+		return fmt.Errorf("%s must be between %g and %d", name, minimum, maximumValidTemperature)
 	}
 	return nil
 }

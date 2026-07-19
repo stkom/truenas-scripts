@@ -98,3 +98,28 @@ func TestConfigRejectsInvalidMinimumTemperatures(t *testing.T) {
 		t.Fatalf("Validate() error = %v, want drive minimum-temperature error", err)
 	}
 }
+
+func TestConfigRejectsUnsafeControlValues(t *testing.T) {
+	tests := []struct {
+		name   string
+		change func(*Config)
+		field  string
+	}{
+		{name: "CPU reference below sensor range", change: func(cfg *Config) { cfg.CPU.ReferenceC = 0 }, field: "cpu.reference_c"},
+		{name: "CPU reference above sensor range", change: func(cfg *Config) { cfg.CPU.ReferenceC = 540 }, field: "cpu.reference_c"},
+		{name: "drive setpoint above sensor range", change: func(cfg *Config) { cfg.Drives.SetpointC = 360 }, field: "drives.setpoint_c"},
+		{name: "CPU gain too large", change: func(cfg *Config) { cfg.CPU.DutyPerDegree = 101 }, field: "cpu.duty_per_degree"},
+		{name: "drive proportional gain too large", change: func(cfg *Config) { cfg.Drives.Kp = 101 }, field: "drives.kp"},
+		{name: "drive derivative gain too large", change: func(cfg *Config) { cfg.Drives.Kd = 101 }, field: "drives.kd"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := DefaultConfig()
+			cfg.Drives.Devices = []string{"/dev/sda"}
+			test.change(&cfg)
+			if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), test.field) {
+				t.Fatalf("Validate() error = %v, want %s error", err, test.field)
+			}
+		})
+	}
+}
