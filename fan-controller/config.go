@@ -49,21 +49,23 @@ type RPMMonitorConfig struct {
 }
 
 type CPUConfig struct {
-	Fan           FanConfig `json:"fan"`
-	PollInterval  Duration  `json:"poll_interval"`
-	ReferenceC    float64   `json:"reference_c"`
-	DutyPerDegree float64   `json:"duty_per_degree"`
-	HwmonRoot     string    `json:"hwmon_root"`
-	IPMISensor    string    `json:"ipmi_sensor"`
+	Fan                 FanConfig `json:"fan"`
+	PollInterval        Duration  `json:"poll_interval"`
+	ReferenceC          float64   `json:"reference_c"`
+	MinimumTemperatureC float64   `json:"minimum_temperature_c"`
+	DutyPerDegree       float64   `json:"duty_per_degree"`
+	HwmonRoot           string    `json:"hwmon_root"`
+	IPMISensor          string    `json:"ipmi_sensor"`
 }
 
 type DriveConfig struct {
-	Fan          FanConfig `json:"fan"`
-	Devices      []string  `json:"devices"`
-	PollInterval Duration  `json:"poll_interval"`
-	SetpointC    float64   `json:"setpoint_c"`
-	Kp           float64   `json:"kp"`
-	Kd           float64   `json:"kd"`
+	Fan                 FanConfig `json:"fan"`
+	Devices             []string  `json:"devices"`
+	PollInterval        Duration  `json:"poll_interval"`
+	SetpointC           float64   `json:"setpoint_c"`
+	MinimumTemperatureC float64   `json:"minimum_temperature_c"`
+	Kp                  float64   `json:"kp"`
+	Kd                  float64   `json:"kd"`
 }
 
 type SafetyConfig struct {
@@ -101,11 +103,12 @@ func DefaultConfig() Config {
 					Sensor: "FAN1", RPMAt30: 400, RPMAt100: 1400,
 				},
 			},
-			PollInterval:  Duration{5 * time.Second},
-			ReferenceC:    54,
-			DutyPerDegree: 6,
-			HwmonRoot:     "/sys/class/hwmon",
-			IPMISensor:    "CPU Temp",
+			PollInterval:        Duration{5 * time.Second},
+			ReferenceC:          54,
+			MinimumTemperatureC: 5,
+			DutyPerDegree:       6,
+			HwmonRoot:           "/sys/class/hwmon",
+			IPMISensor:          "CPU Temp",
 		},
 		Drives: DriveConfig{
 			Fan: FanConfig{
@@ -116,10 +119,11 @@ func DefaultConfig() Config {
 					Enabled: true, Sensor: "FANA", RPMAt30: 600, RPMAt100: 1700,
 				},
 			},
-			PollInterval: Duration{5 * time.Minute},
-			SetpointC:    36,
-			Kp:           4,
-			Kd:           40,
+			PollInterval:        Duration{5 * time.Minute},
+			SetpointC:           36,
+			MinimumTemperatureC: 5,
+			Kp:                  4,
+			Kd:                  40,
 		},
 		Safety:            SafetyConfig{FailureDuty: 100},
 		LogPath:           "/tmp/fan-controller.log",
@@ -192,6 +196,9 @@ func (cfg *Config) Validate() error {
 	if cfg.CPU.DutyPerDegree <= 0 {
 		return errors.New("cpu.duty_per_degree must be positive")
 	}
+	if err := validateMinimumTemperature("cpu.minimum_temperature_c", cfg.CPU.MinimumTemperatureC); err != nil {
+		return err
+	}
 	if strings.TrimSpace(cfg.CPU.HwmonRoot) == "" && strings.TrimSpace(cfg.CPU.IPMISensor) == "" {
 		return errors.New("cpu requires hwmon_root or ipmi_sensor")
 	}
@@ -200,6 +207,9 @@ func (cfg *Config) Validate() error {
 	}
 	if cfg.Drives.Kp < 0 || cfg.Drives.Kd < 0 {
 		return errors.New("drives.kp and drives.kd cannot be negative")
+	}
+	if err := validateMinimumTemperature("drives.minimum_temperature_c", cfg.Drives.MinimumTemperatureC); err != nil {
+		return err
 	}
 	if len(cfg.Drives.Devices) == 0 {
 		return errors.New("drives.devices cannot be empty")
@@ -252,6 +262,13 @@ func validateCommand(name string, cfg CommandConfig) error {
 	}
 	if cfg.Timeout.Duration <= 0 {
 		return fmt.Errorf("%s.timeout must be positive", name)
+	}
+	return nil
+}
+
+func validateMinimumTemperature(name string, temperature float64) error {
+	if temperature < absoluteMinimumTemperature || temperature >= maximumValidTemperature {
+		return fmt.Errorf("%s must be at least %d and below %d", name, absoluteMinimumTemperature, maximumValidTemperature)
 	}
 	return nil
 }

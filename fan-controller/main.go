@@ -5,7 +5,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
@@ -48,14 +47,12 @@ func run(args []string, stdout, stderr io.Writer) int {
 	if closer != nil {
 		defer closer.Close()
 	}
-	slog.SetDefault(logger)
-
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	runner := OSCommandRunner{}
 	ipmi := NewIPMIClient(cfg.IPMI, runner, logger, *dryRun)
-	smartctl := NewSmartctlClient(cfg.Smartctl, runner)
-	controller := NewController(cfg, ipmi, NewCPUReader(cfg.CPU, ipmi), NewDriveReader(smartctl), logger)
+	smartctl := NewSmartctlClient(cfg.Smartctl, cfg.Drives.MinimumTemperatureC, runner)
+	controller := NewController(cfg, ipmi, NewCPUReader(cfg.CPU, ipmi), smartctl.ReadTemperatures, logger)
 	if err := controller.Run(ctx, *once); err != nil {
 		logger.Error("fan controller stopped", "event", "run_failed", "error", err)
 		return 1

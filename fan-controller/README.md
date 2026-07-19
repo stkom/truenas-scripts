@@ -8,10 +8,11 @@ Dual-zone Supermicro IPMI fan controller for TrueNAS SCALE. CPU duty follows pac
 - Any configured drive with an invalid reading sets the drive zone to `safety.failure_duty`.
 - Persistent fan RPM mismatch sets the affected zone to `safety.failure_duty`.
 - Standby drives are not woken. If every drive is in standby, drive duty becomes its configured minimum.
-- SIGINT/SIGTERM restores the BMC fan mode present at startup when `restore_mode_on_exit` is enabled.
+- SIGINT/SIGTERM restores the automatic BMC mode present at startup. If no automatic mode can be restored, both zones are set to `safety.failure_duty`.
 - `--dry-run` reads hardware but skips all IPMI writes.
 - With `read_duty` enabled, each CPU cycle detects and corrects BMC duty resets. This corresponds to legacy `HOW_DUTY=1`.
 - Each CPU cycle also restores externally changed fan mode, waits for the BMC, then forcibly reapplies both zone duties.
+- Drive temperature and RPM checks run independently, so slow disks cannot delay CPU control.
 
 Test this against the exact motherboard and fan wiring before unattended use. Supermicro raw commands are board-specific.
 
@@ -33,6 +34,8 @@ cp fan-controller.example.json fan-controller.json
 
 List every controlled HDD explicitly in `drives.devices`, using stable `/dev/disk/by-id/` paths. `smartctl -n standby` avoids waking sleeping drives; both smartctl 7.4 text-backed and 7.5 structured power-mode JSON are supported. CPU temperature uses Linux hwmon first, then the configured IPMI sensor.
 
+`cpu.minimum_temperature_c` and `drives.minimum_temperature_c` reject implausibly low numeric readings. Both default to 5°C.
+
 File logs rotate before exceeding `log_max_size_mb`. `log_backups` controls how many numbered backups are retained. Unchanged five-second CPU readings are not written at INFO level.
 
 RPM calibration retains the old config values. CPU RPM monitoring defaults off, matching the disabled check in the working shell script. Automatic BMC cold reset is intentionally omitted.
@@ -53,5 +56,7 @@ The executable requires root access plus `ipmitool` and `smartctl`. Use the True
 Replace the old hybrid-controller post-init entry with:
 
 ```sh
-tmux new-session -d -s fan-controller '/root/scripts/fan-controller -config /root/scripts/fan-controller.json'
+tmux new-session -d -s fan-controller 'until /root/scripts/fan-controller -config /root/scripts/fan-controller.json; do sleep 5; done'
 ```
+
+The `until` loop restarts abnormal exits. A graceful SIGINT/SIGTERM exits normally and is not restarted.

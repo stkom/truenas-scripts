@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"sync"
 	"time"
 )
 
@@ -41,7 +42,7 @@ func NewCPUReader(cfg CPUConfig, sensor TemperatureSensor) CPUReader {
 		var hwmonErr error
 		if cfg.HwmonRoot != "" {
 			temperature, err := ReadHwmonCPUTemperature(cfg.HwmonRoot)
-			if err == nil && validTemperature(temperature) {
+			if err == nil && validTemperature(temperature, cfg.MinimumTemperatureC) {
 				return temperature, "hwmon", nil
 			}
 			if err == nil {
@@ -51,7 +52,7 @@ func NewCPUReader(cfg CPUConfig, sensor TemperatureSensor) CPUReader {
 		}
 		if cfg.IPMISensor != "" {
 			temperature, err := sensor.ReadTemperature(ctx, cfg.IPMISensor)
-			if err == nil && validTemperature(temperature) {
+			if err == nil && validTemperature(temperature, cfg.MinimumTemperatureC) {
 				return temperature, "ipmi", nil
 			}
 			if err == nil {
@@ -63,12 +64,6 @@ func NewCPUReader(cfg CPUConfig, sensor TemperatureSensor) CPUReader {
 	}
 }
 
-func NewDriveReader(client *SmartctlClient) DriveReader {
-	return func(ctx context.Context, devices []string) []DriveReading {
-		return ReadDriveTemperatures(ctx, client, devices)
-	}
-}
-
 type controlledZone struct {
 	name        string
 	cfg         FanConfig
@@ -76,28 +71,52 @@ type controlledZone struct {
 	failureDuty int
 	hardware    FanHardware
 	log         *slog.Logger
+	mutation    *sync.Mutex
+	mu          sync.RWMutex
 }
 
-func newControlledZone(name string, cfg FanConfig, failureDuty int, hardware FanHardware, logger *slog.Logger) *controlledZone {
-	return &controlledZone{name: name, cfg: cfg, failureDuty: failureDuty, hardware: hardware, log: logger}
+func newControlledZone(name string, cfg FanConfig, failureDuty int, hardware FanHardware, logger *slog.Logger, mutation *sync.Mutex) *controlledZone {
+	return &controlledZone{name: name, cfg: cfg, failureDuty: failureDuty, hardware: hardware, log: logger, mutation: mutation}
 }
 
 func (zone *controlledZone) set(ctx context.Context, desired int) (bool, error) {
+	zone.mu.Lock()
+	defer zone.mu.Unlock()
 	if desired == zone.duty {
 		return false, nil
 	}
-	if err := zone.force(ctx, desired); err != nil {
+	if err := zone.forceLocked(ctx, desired); err != nil {
 		return false, err
 	}
 	return true, nil
 }
 
 func (zone *controlledZone) force(ctx context.Context, desired int) error {
+	zone.mu.Lock()
+	defer zone.mu.Unlock()
+	return zone.forceLocked(ctx, desired)
+}
+
+func (zone *controlledZone) forceLocked(ctx context.Context, desired int) error {
+	zone.mutation.Lock()
+	defer zone.mutation.Unlock()
 	if err := zone.hardware.SetZoneDuty(ctx, zone.cfg.Zone, desired); err != nil {
 		return fmt.Errorf("error setting %s zone %d duty to %d: %w", zone.name, zone.cfg.Zone, desired, err)
 	}
 	zone.duty = desired
 	return nil
+}
+
+func (zone *controlledZone) currentDuty() int {
+	zone.mu.RLock()
+	defer zone.mu.RUnlock()
+	return zone.duty
+}
+
+func (zone *controlledZone) reapply(ctx context.Context) error {
+	zone.mu.Lock()
+	defer zone.mu.Unlock()
+	return zone.forceLocked(ctx, zone.duty)
 }
 
 func (zone *controlledZone) setOrFailSafe(ctx context.Context, desired int) (bool, error) {
@@ -115,6 +134,8 @@ func (zone *controlledZone) failSafe(ctx context.Context, reason string) error {
 }
 
 func (zone *controlledZone) reconcile(ctx context.Context) error {
+	zone.mu.Lock()
+	defer zone.mu.Unlock()
 	actual, err := zone.hardware.GetZoneDuty(ctx, zone.cfg.Zone)
 	if err != nil {
 		return fmt.Errorf("error reading %s zone %d duty: %w", zone.name, zone.cfg.Zone, err)
@@ -123,7 +144,7 @@ func (zone *controlledZone) reconcile(ctx context.Context) error {
 		return nil
 	}
 	zone.log.Warn("fan duty changed externally", "event", "duty_mismatch", "zone", zone.cfg.Zone, "actual", actual, "desired", zone.duty)
-	return zone.force(ctx, zone.duty)
+	return zone.forceLocked(ctx, zone.duty)
 }
 
 func (zone *controlledZone) verifyRPM(ctx context.Context, retries int, settleTime time.Duration) error {
@@ -132,20 +153,21 @@ func (zone *controlledZone) verifyRPM(ctx context.Context, retries int, settleTi
 		return nil
 	}
 	for attempt := 0; ; attempt++ {
+		duty := zone.currentDuty()
 		rpm, err := zone.hardware.ReadFanRPM(ctx, monitor.Sensor)
 		if err != nil {
 			return zone.rpmFailure(ctx, fmt.Errorf("error reading %s RPM: %w", monitor.Sensor, err))
 		}
-		mismatch, reason := fanRPMMismatch(zone.duty, rpm, monitor)
-		zone.log.Info("fan RPM checked", "event", "rpm_check", "sensor", monitor.Sensor, "rpm", rpm, "duty", zone.duty, "mismatch", mismatch)
+		mismatch, reason := fanRPMMismatch(duty, rpm, monitor)
+		zone.log.Info("fan RPM checked", "event", "rpm_check", "sensor", monitor.Sensor, "rpm", rpm, "duty", duty, "mismatch", mismatch)
 		if !mismatch {
 			return nil
 		}
 		if attempt >= retries {
 			return zone.rpmFailure(ctx, errors.New(reason))
 		}
-		zone.log.Warn("fan RPM mismatch; reapplying duty", "event", "rpm_mismatch", "sensor", monitor.Sensor, "rpm", rpm, "duty", zone.duty, "attempt", attempt+1, "reason", reason)
-		if err := zone.force(ctx, zone.duty); err != nil {
+		zone.log.Warn("fan RPM mismatch; reapplying duty", "event", "rpm_mismatch", "sensor", monitor.Sensor, "rpm", rpm, "duty", duty, "attempt", attempt+1, "reason", reason)
+		if err := zone.reapply(ctx); err != nil {
 			return zone.rpmFailure(ctx, err)
 		}
 		if err := waitFor(ctx, settleTime); err != nil {
@@ -168,59 +190,80 @@ type Controller struct {
 	driveZone  *controlledZone
 	driveErr   float64
 	oldMode    int
-	haveMode   bool
+	mutation   sync.Mutex
 }
 
 func NewController(cfg *Config, hardware FanHardware, cpuReader CPUReader, driveReader DriveReader, logger *slog.Logger) *Controller {
-	return &Controller{
+	controller := &Controller{
 		cfg:        cfg,
 		hardware:   hardware,
 		readCPU:    cpuReader,
 		readDrives: driveReader,
 		log:        logger,
-		cpuZone:    newControlledZone("CPU", cfg.CPU.Fan, cfg.Safety.FailureDuty, hardware, logger),
-		driveZone:  newControlledZone("drive", cfg.Drives.Fan, cfg.Safety.FailureDuty, hardware, logger),
 	}
+	controller.cpuZone = newControlledZone("CPU", cfg.CPU.Fan, cfg.Safety.FailureDuty, hardware, logger, &controller.mutation)
+	controller.driveZone = newControlledZone("drive", cfg.Drives.Fan, cfg.Safety.FailureDuty, hardware, logger, &controller.mutation)
+	return controller
 }
 
 func (controller *Controller) Run(ctx context.Context, once bool) error {
 	if err := controller.start(ctx); err != nil {
 		return err
 	}
-	defer controller.restoreMode()
+	defer controller.shutdown()
 
 	if err := controller.updateCPU(ctx); err != nil {
 		controller.log.Error("CPU update failed", "event", "cpu_update_failed", "error", err)
 	}
-	if err := controller.updateDrives(ctx); err != nil {
-		controller.log.Error("drive update failed", "event", "drive_update_failed", "error", err)
-	}
-	if err := controller.verifyFanRPMs(ctx); err != nil {
-		controller.log.Error("fan RPM verification failed", "event", "rpm_verification_failed", "error", err)
-	}
 	if once {
+		controller.runDriveCycle(ctx)
 		return nil
 	}
 
+	runCtx, cancel := context.WithCancel(ctx)
+	var driveWorker sync.WaitGroup
+	driveWorker.Go(func() {
+		controller.runDriveLoop(runCtx)
+	})
+	defer func() {
+		cancel()
+		driveWorker.Wait()
+	}()
+
 	cpuTicker := time.NewTicker(controller.cfg.CPU.PollInterval.Duration)
-	driveTicker := time.NewTicker(controller.cfg.Drives.PollInterval.Duration)
 	defer cpuTicker.Stop()
-	defer driveTicker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
 		case <-cpuTicker.C:
-			controller.runCPUCycle(ctx)
-		case <-driveTicker.C:
-			if err := controller.updateDrives(ctx); err != nil {
-				controller.log.Error("drive update failed", "event", "drive_update_failed", "error", err)
+			if ctx.Err() != nil {
+				return nil
 			}
-			if err := controller.verifyFanRPMs(ctx); err != nil {
-				controller.log.Error("fan RPM verification failed", "event", "rpm_verification_failed", "error", err)
-			}
+			controller.runCPUCycle(runCtx)
 		}
+	}
+}
+
+func (controller *Controller) runDriveLoop(ctx context.Context) {
+	for {
+		controller.runDriveCycle(ctx)
+		if err := waitFor(ctx, controller.cfg.Drives.PollInterval.Duration); err != nil {
+			return
+		}
+	}
+}
+
+func (controller *Controller) runDriveCycle(ctx context.Context) {
+	if err := controller.updateDrives(ctx); err != nil && ctx.Err() == nil {
+		controller.log.Error("drive update failed", "event", "drive_update_failed", "error", err)
+	}
+	if ctx.Err() != nil {
+		return
+	}
+	if err := controller.verifyFanRPMs(ctx); err != nil && ctx.Err() == nil {
+		controller.log.Error("fan RPM verification failed", "event", "rpm_verification_failed", "error", err)
 	}
 }
 
@@ -244,9 +287,8 @@ func (controller *Controller) start(ctx context.Context) error {
 		return fmt.Errorf("error reading initial fan mode: %w", err)
 	}
 	controller.oldMode = mode
-	controller.haveMode = true
 	if mode != controller.cfg.ManualMode {
-		if err := controller.hardware.SetFanMode(ctx, controller.cfg.ManualMode); err != nil {
+		if err := controller.setFanMode(ctx, controller.cfg.ManualMode); err != nil {
 			return fmt.Errorf("error enabling manual fan mode: %w", err)
 		}
 		if err := waitFor(ctx, controller.cfg.ModeSettleTime.Duration); err != nil {
@@ -264,8 +306,8 @@ func (controller *Controller) start(ctx context.Context) error {
 		"event", "startup_completed",
 		"old_mode", controller.oldMode,
 		"manual_mode", controller.cfg.ManualMode,
-		"cpu_duty", controller.cpuZone.duty,
-		"drive_duty", controller.driveZone.duty,
+		"cpu_duty", controller.cpuZone.currentDuty(),
+		"drive_duty", controller.driveZone.currentDuty(),
 		"drive_count", len(controller.cfg.Drives.Devices),
 	)
 	return nil
@@ -279,17 +321,30 @@ func (controller *Controller) startFailure(ctx context.Context, cause error) err
 	)
 }
 
-func (controller *Controller) restoreMode() {
-	if !controller.cfg.RestoreModeOnExit || !controller.haveMode || controller.oldMode == controller.cfg.ManualMode {
-		return
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), controller.cfg.IPMI.Timeout.Duration)
+func (controller *Controller) shutdown() {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*controller.cfg.IPMI.Timeout.Duration)
 	defer cancel()
-	if err := controller.hardware.SetFanMode(ctx, controller.oldMode); err != nil {
-		controller.log.Error("fan mode restoration failed", "event", "fan_mode_restore_failed", "error", err)
-		return
+	if controller.cfg.RestoreModeOnExit && controller.oldMode != controller.cfg.ManualMode {
+		if err := controller.setFanMode(ctx, controller.oldMode); err == nil {
+			controller.log.Info("fan mode restored", "event", "fan_mode_restored", "mode", controller.oldMode)
+			return
+		} else {
+			controller.log.Error("fan mode restoration failed", "event", "fan_mode_restore_failed", "error", err)
+		}
 	}
-	controller.log.Info("fan mode restored", "event", "fan_mode_restored", "mode", controller.oldMode)
+	controller.log.Info("setting failure duties before shutdown", "event", "shutdown_failure_duties", "duty", controller.cfg.Safety.FailureDuty)
+	if err := errors.Join(
+		controller.cpuZone.force(ctx, controller.cfg.Safety.FailureDuty),
+		controller.driveZone.force(ctx, controller.cfg.Safety.FailureDuty),
+	); err != nil {
+		controller.log.Error("shutdown failure duties failed", "event", "shutdown_failure_duties_failed", "error", err)
+	}
+}
+
+func (controller *Controller) setFanMode(ctx context.Context, mode int) error {
+	controller.mutation.Lock()
+	defer controller.mutation.Unlock()
+	return controller.hardware.SetFanMode(ctx, mode)
 }
 
 func (controller *Controller) ensureManualMode(ctx context.Context) error {
@@ -301,15 +356,15 @@ func (controller *Controller) ensureManualMode(ctx context.Context) error {
 		return nil
 	}
 	controller.log.Warn("fan mode changed externally", "event", "fan_mode_changed", "mode", mode)
-	if err := controller.hardware.SetFanMode(ctx, controller.cfg.ManualMode); err != nil {
+	if err := controller.setFanMode(ctx, controller.cfg.ManualMode); err != nil {
 		return fmt.Errorf("error restoring manual fan mode: %w", err)
 	}
 	if err := waitFor(ctx, controller.cfg.ModeSettleTime.Duration); err != nil {
 		return fmt.Errorf("error waiting after manual fan mode restoration: %w", err)
 	}
 	return errors.Join(
-		controller.cpuZone.force(ctx, controller.cpuZone.duty),
-		controller.driveZone.force(ctx, controller.driveZone.duty),
+		controller.cpuZone.reapply(ctx),
+		controller.driveZone.reapply(ctx),
 	)
 }
 
@@ -327,7 +382,7 @@ func (controller *Controller) reconcileDuties(ctx context.Context) error {
 
 func (controller *Controller) updateCPU(ctx context.Context) error {
 	temperature, source, err := controller.readCPU(ctx)
-	if err == nil && !validTemperature(temperature) {
+	if err == nil && !validTemperature(temperature, controller.cfg.CPU.MinimumTemperatureC) {
 		err = fmt.Errorf("CPU reader returned invalid temperature %.1f", temperature)
 	}
 	if err != nil {
@@ -348,7 +403,10 @@ func (controller *Controller) updateCPU(ctx context.Context) error {
 
 func (controller *Controller) updateDrives(ctx context.Context) error {
 	readings := controller.readDrives(ctx, controller.cfg.Drives.Devices)
-	result := calculateDriveDuty(controller.driveZone.duty, controller.driveErr, readings, controller.cfg.Drives, controller.cfg.Safety.FailureDuty)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	result := calculateDriveDuty(controller.driveZone.currentDuty(), controller.driveErr, readings, controller.cfg.Drives, controller.cfg.Safety.FailureDuty)
 	controller.logDriveIssues(readings)
 	if result.Failed > 0 || result.Active == 0 {
 		controller.driveErr = 0
@@ -407,11 +465,19 @@ func (controller *Controller) verifyFanRPMs(ctx context.Context) error {
 }
 
 func fanRPMMismatch(duty int, rpm float64, monitor RPMMonitorConfig) (bool, string) {
+	if math.IsNaN(rpm) {
+		return true, "RPM is not a number"
+	}
+	expected := float64(monitor.RPMAt30) * float64(duty) / 30
+	if duty > 30 {
+		expected = float64(monitor.RPMAt30) + float64(duty-30)*float64(monitor.RPMAt100-monitor.RPMAt30)/70
+	}
+	minimum := 0.5 * expected
 	if duty >= 95 {
-		minimum := 0.8 * float64(monitor.RPMAt100)
-		if rpm < minimum {
-			return true, fmt.Sprintf("RPM %.0f below high-duty minimum %.0f", rpm, minimum)
-		}
+		minimum = 0.8 * float64(monitor.RPMAt100)
+	}
+	if rpm < minimum {
+		return true, fmt.Sprintf("RPM %.0f below expected minimum %.0f", rpm, minimum)
 	}
 	if duty < 25 {
 		maximum := 1.2 * float64(monitor.RPMAt30)

@@ -43,12 +43,13 @@ type smartctlOutput struct {
 }
 
 type SmartctlClient struct {
-	cfg     CommandConfig
-	command ConfiguredCommand
+	cfg                CommandConfig
+	minimumTemperature float64
+	command            ConfiguredCommand
 }
 
-func NewSmartctlClient(cfg CommandConfig, runner CommandRunner) *SmartctlClient {
-	return &SmartctlClient{cfg: cfg, command: NewConfiguredCommand(cfg, runner)}
+func NewSmartctlClient(cfg CommandConfig, minimumTemperature float64, runner CommandRunner) *SmartctlClient {
+	return &SmartctlClient{cfg: cfg, minimumTemperature: minimumTemperature, command: NewConfiguredCommand(cfg, runner)}
 }
 
 func (client *SmartctlClient) ReadTemperature(ctx context.Context, device string) DriveReading {
@@ -78,7 +79,7 @@ func (client *SmartctlClient) ReadTemperature(ctx context.Context, device string
 		return failedDrive(device, errors.New("smartctl returned no temperature"))
 	}
 	temperature := *output.Temperature.Current
-	if !validTemperature(temperature) {
+	if !validTemperature(temperature, client.minimumTemperature) {
 		return failedDrive(device, fmt.Errorf("smartctl returned invalid temperature %.1f", temperature))
 	}
 	reading := DriveReading{Device: device, State: DriveActive, Temperature: temperature}
@@ -111,7 +112,7 @@ func isStandbyMode(powerMode string) bool {
 	return mode == "standby" || mode == "sleep"
 }
 
-func ReadDriveTemperatures(ctx context.Context, client *SmartctlClient, devices []string) []DriveReading {
+func (client *SmartctlClient) ReadTemperatures(ctx context.Context, devices []string) []DriveReading {
 	readings := make([]DriveReading, len(devices))
 	var wg sync.WaitGroup
 	for index, device := range devices {
@@ -153,7 +154,7 @@ func ReadHwmonCPUTemperature(root string) (float64, error) {
 				continue
 			}
 			temperature := millidegrees / 1000
-			if validTemperature(temperature) {
+			if validTemperature(temperature, absoluteMinimumTemperature) {
 				temperatures = append(temperatures, temperature)
 			}
 		}
@@ -197,10 +198,10 @@ func maxFloat(values []float64) float64 {
 }
 
 const (
-	minimumValidTemperature = -20
-	maximumValidTemperature = 150
+	absoluteMinimumTemperature = -20
+	maximumValidTemperature    = 150
 )
 
-func validTemperature(temperature float64) bool {
-	return temperature >= minimumValidTemperature && temperature <= maximumValidTemperature && !math.IsNaN(temperature)
+func validTemperature(temperature, minimum float64) bool {
+	return temperature >= minimum && temperature <= maximumValidTemperature && !math.IsNaN(temperature)
 }

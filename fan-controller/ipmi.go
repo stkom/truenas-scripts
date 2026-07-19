@@ -72,7 +72,7 @@ func (client *IPMIClient) ReadFanRPM(ctx context.Context, sensor string) (float6
 }
 
 func (client *IPMIClient) readNumericSensor(ctx context.Context, sensor string) (float64, error) {
-	result, err := client.run(ctx, "sensor", "get", sensor)
+	result, err := client.command.Run(ctx, "sensor", "get", sensor)
 	if err != nil {
 		return 0, err
 	}
@@ -91,7 +91,7 @@ func (client *IPMIClient) readNumericSensor(ctx context.Context, sensor string) 
 }
 
 func (client *IPMIClient) raw(ctx context.Context, args ...string) ([]byte, error) {
-	result, err := client.run(ctx, append([]string{"raw"}, args...)...)
+	result, err := client.command.Run(ctx, append([]string{"raw"}, args...)...)
 	if err != nil {
 		return nil, err
 	}
@@ -99,10 +99,6 @@ func (client *IPMIClient) raw(ctx context.Context, args ...string) ([]byte, erro
 		return nil, commandExitError(client.cfg.Path, result)
 	}
 	return result.Stdout, nil
-}
-
-func (client *IPMIClient) run(ctx context.Context, args ...string) (CommandResult, error) {
-	return client.command.Run(ctx, args...)
 }
 
 func parseHexByte(output []byte) (int, error) {

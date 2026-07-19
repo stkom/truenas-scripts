@@ -5,7 +5,10 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 type dutyWrite struct {
@@ -14,6 +17,7 @@ type dutyWrite struct {
 }
 
 type fakeFanHardware struct {
+	mu            sync.Mutex
 	mode          int
 	duties        map[int]int
 	rpms          map[string]float64
@@ -35,10 +39,14 @@ func newFakeFanHardware() *fakeFanHardware {
 }
 
 func (hardware *fakeFanHardware) GetFanMode(context.Context) (int, error) {
+	hardware.mu.Lock()
+	defer hardware.mu.Unlock()
 	return hardware.mode, hardware.modeReadErr
 }
 
 func (hardware *fakeFanHardware) SetFanMode(_ context.Context, mode int) error {
+	hardware.mu.Lock()
+	defer hardware.mu.Unlock()
 	hardware.modeWrites = append(hardware.modeWrites, mode)
 	if hardware.modeWriteErr != nil {
 		return hardware.modeWriteErr
@@ -48,10 +56,14 @@ func (hardware *fakeFanHardware) SetFanMode(_ context.Context, mode int) error {
 }
 
 func (hardware *fakeFanHardware) GetZoneDuty(_ context.Context, zone int) (int, error) {
+	hardware.mu.Lock()
+	defer hardware.mu.Unlock()
 	return hardware.duties[zone], hardware.dutyReadErr[zone]
 }
 
 func (hardware *fakeFanHardware) SetZoneDuty(_ context.Context, zone, duty int) error {
+	hardware.mu.Lock()
+	defer hardware.mu.Unlock()
 	hardware.dutyWrites = append(hardware.dutyWrites, dutyWrite{zone: zone, duty: duty})
 	if hardware.failingDuties[duty] {
 		return errors.New("duty write failed")
@@ -61,6 +73,8 @@ func (hardware *fakeFanHardware) SetZoneDuty(_ context.Context, zone, duty int) 
 }
 
 func (hardware *fakeFanHardware) ReadFanRPM(_ context.Context, sensor string) (float64, error) {
+	hardware.mu.Lock()
+	defer hardware.mu.Unlock()
 	return hardware.rpms[sensor], nil
 }
 
@@ -134,7 +148,9 @@ func TestFanRPMMismatch(t *testing.T) {
 		{name: "high duty valid", duty: 100, rpm: 1400, want: false},
 		{name: "low duty too fast", duty: 20, rpm: 800, want: true},
 		{name: "low duty valid", duty: 20, rpm: 700, want: false},
-		{name: "middle duty unchecked", duty: 50, rpm: 0, want: false},
+		{name: "stopped at low duty", duty: 20, rpm: 0, want: true},
+		{name: "stopped at middle duty", duty: 50, rpm: 0, want: true},
+		{name: "middle duty valid", duty: 50, rpm: 700, want: false},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -195,7 +211,7 @@ func TestControllerModeFailureUsesBothFailureDuties(t *testing.T) {
 func TestControlledZoneCacheChangesOnlyAfterSuccessfulWrite(t *testing.T) {
 	hardware := newFakeFanHardware()
 	hardware.failingDuties[60] = true
-	zone := newControlledZone("test", FanConfig{Zone: 1}, 100, hardware, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	zone := newControlledZone("test", FanConfig{Zone: 1}, 100, hardware, slog.New(slog.NewTextHandler(io.Discard, nil)), &sync.Mutex{})
 	zone.duty = 40
 
 	if _, err := zone.set(context.Background(), 60); err == nil {
@@ -257,7 +273,7 @@ func TestControlledZoneRPMMismatchUsesFailureDuty(t *testing.T) {
 		RPMMonitor: RPMMonitorConfig{
 			Enabled: true, Sensor: "FANA", RPMAt30: 600, RPMAt100: 1700,
 		},
-	}, 100, hardware, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	}, 100, hardware, slog.New(slog.NewTextHandler(io.Discard, nil)), &sync.Mutex{})
 	zone.duty = 20
 
 	if err := zone.verifyRPM(context.Background(), 0, 0); err == nil {
@@ -265,5 +281,143 @@ func TestControlledZoneRPMMismatchUsesFailureDuty(t *testing.T) {
 	}
 	if zone.duty != 100 || hardware.duties[1] != 100 {
 		t.Errorf("RPM failure duty cache/hardware = %d/%d, want 100/100", zone.duty, hardware.duties[1])
+	}
+}
+
+func TestControllerRejectsImplausiblyLowCPUTemperature(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Drives.Devices = []string{"/dev/sda"}
+	hardware := newFakeFanHardware()
+	controller := newTestController(&cfg, hardware,
+		func(context.Context) (float64, string, error) { return 0, "test", nil },
+		nil,
+	)
+	controller.cpuZone.duty = 30
+
+	if err := controller.updateCPU(context.Background()); err == nil {
+		t.Fatal("updateCPU() error is nil")
+	}
+	if controller.cpuZone.currentDuty() != cfg.Safety.FailureDuty {
+		t.Errorf("CPU duty = %d, want %d", controller.cpuZone.currentDuty(), cfg.Safety.FailureDuty)
+	}
+}
+
+func TestControllerShutdownUsesFailureDutiesWhenStartupModeWasManual(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Drives.Devices = []string{"/dev/sda"}
+	cfg.ModeSettleTime.Duration = 0
+	cfg.RPMSettleTime.Duration = 0
+	cfg.CPU.Fan.RPMMonitor.Enabled = false
+	cfg.Drives.Fan.RPMMonitor.Enabled = false
+	hardware := newFakeFanHardware()
+	hardware.mode = cfg.ManualMode
+	controller := newTestController(&cfg, hardware,
+		func(context.Context) (float64, string, error) { return 40, "test", nil },
+		func(context.Context, []string) []DriveReading { return []DriveReading{{State: DriveStandby}} },
+	)
+
+	if err := controller.Run(context.Background(), true); err != nil {
+		t.Fatal(err)
+	}
+	if hardware.duties[cfg.CPU.Fan.Zone] != cfg.Safety.FailureDuty || hardware.duties[cfg.Drives.Fan.Zone] != cfg.Safety.FailureDuty {
+		t.Errorf("shutdown duties = %d/%d, want %d/%d",
+			hardware.duties[cfg.CPU.Fan.Zone], hardware.duties[cfg.Drives.Fan.Zone],
+			cfg.Safety.FailureDuty, cfg.Safety.FailureDuty)
+	}
+}
+
+func TestControllerShutdownRestoresAutomaticMode(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Drives.Devices = []string{"/dev/sda"}
+	cfg.ModeSettleTime.Duration = 0
+	cfg.RPMSettleTime.Duration = 0
+	cfg.CPU.Fan.RPMMonitor.Enabled = false
+	cfg.Drives.Fan.RPMMonitor.Enabled = false
+	hardware := newFakeFanHardware()
+	hardware.mode = 0
+	controller := newTestController(&cfg, hardware,
+		func(context.Context) (float64, string, error) { return 40, "test", nil },
+		func(context.Context, []string) []DriveReading { return []DriveReading{{State: DriveStandby}} },
+	)
+
+	if err := controller.Run(context.Background(), true); err != nil {
+		t.Fatal(err)
+	}
+	if hardware.mode != 0 {
+		t.Errorf("shutdown mode = %d, want startup mode 0", hardware.mode)
+	}
+	if hardware.duties[cfg.CPU.Fan.Zone] == cfg.Safety.FailureDuty || hardware.duties[cfg.Drives.Fan.Zone] == cfg.Safety.FailureDuty {
+		t.Errorf("duties unexpectedly set to failure duty: %v", hardware.duties)
+	}
+}
+
+func TestControllerShutdownFallsBackWhenModeRestorationFails(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Drives.Devices = []string{"/dev/sda"}
+	hardware := newFakeFanHardware()
+	hardware.mode = cfg.ManualMode
+	hardware.modeWriteErr = errors.New("mode write failed")
+	controller := newTestController(&cfg, hardware, nil, nil)
+	controller.oldMode = 0
+
+	controller.shutdown()
+	if hardware.duties[cfg.CPU.Fan.Zone] != cfg.Safety.FailureDuty || hardware.duties[cfg.Drives.Fan.Zone] != cfg.Safety.FailureDuty {
+		t.Errorf("fallback duties = %d/%d, want %d/%d",
+			hardware.duties[cfg.CPU.Fan.Zone], hardware.duties[cfg.Drives.Fan.Zone],
+			cfg.Safety.FailureDuty, cfg.Safety.FailureDuty)
+	}
+}
+
+func TestSlowDriveCycleDoesNotBlockCPUCycles(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Drives.Devices = []string{"/dev/sda"}
+	cfg.CPU.PollInterval.Duration = 5 * time.Millisecond
+	cfg.Drives.PollInterval.Duration = time.Hour
+	cfg.ModeSettleTime.Duration = 0
+	cfg.ReadDuty = false
+	cfg.CPU.Fan.RPMMonitor.Enabled = false
+	cfg.Drives.Fan.RPMMonitor.Enabled = false
+	hardware := newFakeFanHardware()
+	hardware.mode = cfg.ManualMode
+	driveStarted := make(chan struct{})
+	var cpuReads atomic.Int32
+	controller := newTestController(&cfg, hardware,
+		func(context.Context) (float64, string, error) {
+			cpuReads.Add(1)
+			return 40, "test", nil
+		},
+		func(ctx context.Context, _ []string) []DriveReading {
+			close(driveStarted)
+			<-ctx.Done()
+			return nil
+		},
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- controller.Run(ctx, false) }()
+	select {
+	case <-driveStarted:
+	case <-time.After(time.Second):
+		t.Fatal("drive cycle did not start")
+	}
+	deadline := time.After(time.Second)
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for cpuReads.Load() < 2 {
+		select {
+		case <-deadline:
+			t.Fatal("CPU cycle was blocked by drive reading")
+		case <-ticker.C:
+		}
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("controller did not stop")
 	}
 }

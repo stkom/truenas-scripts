@@ -23,6 +23,7 @@
     },
     "poll_interval": "5s",
     "reference_c": 54,
+    "minimum_temperature_c": 5,
     "duty_per_degree": 6,
     "hwmon_root": "/sys/class/hwmon",
     "ipmi_sensor": "CPU Temp"
@@ -49,6 +50,7 @@
     ],
     "poll_interval": "5m",
     "setpoint_c": 36,
+    "minimum_temperature_c": 5,
     "kp": 4,
     "kd": 40
   },

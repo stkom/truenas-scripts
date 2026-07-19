@@ -38,6 +38,9 @@ func TestLoadConfigAppliesDefaultsAndOverrides(t *testing.T) {
 	if cfg.LogMaxSizeMB != 5 || cfg.LogBackups != 2 {
 		t.Errorf("log rotation = %d MB/%d backups, want 5/2", cfg.LogMaxSizeMB, cfg.LogBackups)
 	}
+	if cfg.CPU.MinimumTemperatureC != 5 || cfg.Drives.MinimumTemperatureC != 5 {
+		t.Errorf("minimum temperatures = %v/%v, want 5/5", cfg.CPU.MinimumTemperatureC, cfg.Drives.MinimumTemperatureC)
+	}
 }
 
 func TestConfigRejectsInvalidLogRotation(t *testing.T) {
@@ -77,5 +80,21 @@ func TestConfigRejectsDuplicateZones(t *testing.T) {
 	err := cfg.Validate()
 	if err == nil || !strings.Contains(err.Error(), "zones must differ") {
 		t.Fatalf("Validate() error = %v, want duplicate zone error", err)
+	}
+}
+
+func TestConfigRejectsInvalidMinimumTemperatures(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Drives.Devices = []string{"/dev/sda"}
+	cfg.CPU.MinimumTemperatureC = -21
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "cpu.minimum_temperature_c") {
+		t.Fatalf("Validate() error = %v, want CPU minimum-temperature error", err)
+	}
+
+	cfg = DefaultConfig()
+	cfg.Drives.Devices = []string{"/dev/sda"}
+	cfg.Drives.MinimumTemperatureC = 150
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "drives.minimum_temperature_c") {
+		t.Fatalf("Validate() error = %v, want drive minimum-temperature error", err)
 	}
 }

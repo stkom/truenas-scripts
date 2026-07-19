@@ -16,7 +16,7 @@ func TestSmartctlReadTemperature(t *testing.T) {
 			"temperature":{"current":37}
 		}`), ExitCode: 8}, nil
 	})
-	client := NewSmartctlClient(CommandConfig{Path: "smartctl", Timeout: Duration{time.Second}}, runner)
+	client := NewSmartctlClient(CommandConfig{Path: "smartctl", Timeout: Duration{time.Second}}, 5, runner)
 
 	reading := client.ReadTemperature(context.Background(), "/dev/sda")
 	if reading.State != DriveActive || reading.Temperature != 37 {
@@ -34,7 +34,7 @@ func TestSmartctlRecognizesStandby(t *testing.T) {
 				"smartctl":{"exit_status":2,"output":["Device is in STANDBY mode, exit(2)"]}
 			}`), ExitCode: 2}, nil
 		})
-		client := NewSmartctlClient(CommandConfig{Path: "smartctl", Timeout: Duration{time.Second}}, runner)
+		client := NewSmartctlClient(CommandConfig{Path: "smartctl", Timeout: Duration{time.Second}}, 5, runner)
 
 		reading := client.ReadTemperature(context.Background(), "/dev/sda")
 		if reading.State != DriveStandby {
@@ -49,7 +49,7 @@ func TestSmartctlRecognizesStandby(t *testing.T) {
 			"power_mode":{"ata_value":0,"name":"STANDBY"}
 		}`), ExitCode: 2}, nil
 		})
-		client := NewSmartctlClient(CommandConfig{Path: "smartctl", Timeout: Duration{time.Second}}, runner)
+		client := NewSmartctlClient(CommandConfig{Path: "smartctl", Timeout: Duration{time.Second}}, 5, runner)
 
 		reading := client.ReadTemperature(context.Background(), "/dev/sda")
 		if reading.State != DriveStandby {
@@ -62,7 +62,7 @@ func TestSmartctlDoesNotMistakeOpenFailureForStandby(t *testing.T) {
 	runner := runnerFunc(func(_ context.Context, _ string, _ ...string) (CommandResult, error) {
 		return CommandResult{Stdout: []byte(`{"smartctl":{"exit_status":2}}`), ExitCode: 2}, nil
 	})
-	client := NewSmartctlClient(CommandConfig{Path: "smartctl", Timeout: Duration{time.Second}}, runner)
+	client := NewSmartctlClient(CommandConfig{Path: "smartctl", Timeout: Duration{time.Second}}, 5, runner)
 
 	reading := client.ReadTemperature(context.Background(), "/dev/missing")
 	if reading.State != DriveFailed {
@@ -74,7 +74,19 @@ func TestSmartctlMissingTemperatureFails(t *testing.T) {
 	runner := runnerFunc(func(_ context.Context, _ string, _ ...string) (CommandResult, error) {
 		return CommandResult{Stdout: []byte(`{"smartctl":{"exit_status":0}}`)}, nil
 	})
-	client := NewSmartctlClient(CommandConfig{Path: "smartctl", Timeout: Duration{time.Second}}, runner)
+	client := NewSmartctlClient(CommandConfig{Path: "smartctl", Timeout: Duration{time.Second}}, 5, runner)
+
+	reading := client.ReadTemperature(context.Background(), "/dev/sda")
+	if reading.State != DriveFailed {
+		t.Errorf("reading = %+v, want failed", reading)
+	}
+}
+
+func TestSmartctlRejectsImplausiblyLowTemperature(t *testing.T) {
+	runner := runnerFunc(func(_ context.Context, _ string, _ ...string) (CommandResult, error) {
+		return CommandResult{Stdout: []byte(`{"smartctl":{"exit_status":0},"temperature":{"current":0}}`)}, nil
+	})
+	client := NewSmartctlClient(CommandConfig{Path: "smartctl", Timeout: Duration{time.Second}}, 5, runner)
 
 	reading := client.ReadTemperature(context.Background(), "/dev/sda")
 	if reading.State != DriveFailed {
@@ -88,7 +100,7 @@ func TestSmartctlUsesCompatibleJSONOutput(t *testing.T) {
 		gotArgs = append([]string{}, args...)
 		return CommandResult{Stdout: []byte(`{"smartctl":{"exit_status":0},"temperature":{"current":36}}`)}, nil
 	})
-	client := NewSmartctlClient(CommandConfig{Path: "smartctl", Args: []string{"--nocheck"}, Timeout: Duration{time.Second}}, runner)
+	client := NewSmartctlClient(CommandConfig{Path: "smartctl", Args: []string{"--nocheck"}, Timeout: Duration{time.Second}}, 5, runner)
 
 	client.ReadTemperature(context.Background(), "/dev/disk/by-id/example")
 	want := []string{"--nocheck", "-a", "--json=o", "-n", "standby", "/dev/disk/by-id/example"}
