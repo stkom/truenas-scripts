@@ -1,0 +1,66 @@
+{
+  "ipmi": {
+    "path": "/usr/bin/ipmitool",
+    "args": [],
+    "timeout": "10s"
+  },
+  "smartctl": {
+    "path": "/usr/sbin/smartctl",
+    "args": [],
+    "timeout": "15s"
+  },
+  "cpu": {
+    "fan": {
+      "zone": 0,
+      "min_duty": 30,
+      "max_duty": 100,
+      "rpm_monitor": {
+        "enabled": false,
+        "sensor": "FAN1",
+        "rpm_at_30": 400,
+        "rpm_at_100": 1400
+      }
+    },
+    "poll_interval": "5s",
+    "reference_c": 54,
+    "duty_per_degree": 6,
+    "hwmon_root": "/sys/class/hwmon",
+    "ipmi_sensor": "CPU Temp"
+  },
+  "drives": {
+    "fan": {
+      "zone": 1,
+      "min_duty": 20,
+      "max_duty": 100,
+      "rpm_monitor": {
+        "enabled": true,
+        "sensor": "FANA",
+        "rpm_at_30": 600,
+        "rpm_at_100": 1700
+      }
+    },
+    "devices": [
+      "/dev/sdb",
+      "/dev/sdc",
+      "/dev/sdd",
+      "/dev/sde",
+      "/dev/sdf",
+      "/dev/sdg"
+    ],
+    "poll_interval": "5m",
+    "setpoint_c": 36,
+    "kp": 4,
+    "kd": 40
+  },
+  "safety": {
+    "failure_duty": 100
+  },
+  "log_path": "/root/scripts/fan-controller.log",
+  "manual_mode": 1,
+  "initial_duty": 50,
+  "restore_mode_on_exit": true,
+  "mode_settle_time": "5s",
+  "read_duty": true,
+  "rpm_settle_time": "5s",
+  "rpm_retries": 2
+}

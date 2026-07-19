@@ -1,0 +1,72 @@
+{
+  "jc42-i2c-0-1b": {
+    "Adapter": "SMBus I801 adapter at 0580",
+    "temp1": {
+      "temp1_input": 27.750,
+      "temp1_max": 75.000,
+      "temp1_max_hyst": 75.000,
+      "temp1_min": 0.000,
+      "temp1_crit": 97.000,
+      "temp1_crit_hyst": 97.000,
+      "temp1_max_alarm": 0.000,
+      "temp1_min_alarm": 0.000,
+      "temp1_crit_alarm": 0.000
+    }
+  },
+  "pch_skylake-virtual-0": {
+    "Adapter": "Virtual device",
+    "temp1": {
+      "temp1_input": 32.000
+    }
+  },
+  "acpitz-acpi-0": {
+    "Adapter": "ACPI interface",
+    "temp1": {
+      "temp1_input": 27.800
+    },
+    "temp2": {
+      "temp2_input": 29.800
+    }
+  },
+  "coretemp-isa-0000": {
+    "Adapter": "ISA adapter",
+    "Package id 0": {
+      "temp1_input": 28.000,
+      "temp1_max": 80.000,
+      "temp1_crit": 100.000,
+      "temp1_crit_alarm": 0.000
+    },
+    "Core 0": {
+      "temp2_input": 28.000,
+      "temp2_max": 80.000,
+      "temp2_crit": 100.000,
+      "temp2_crit_alarm": 0.000
+    },
+    "Core 1": {
+      "temp3_input": 28.000,
+      "temp3_max": 80.000,
+      "temp3_crit": 100.000,
+      "temp3_crit_alarm": 0.000
+    }
+  },
+  "jc42-i2c-0-19": {
+    "Adapter": "SMBus I801 adapter at 0580",
+    "temp1": {
+      "temp1_input": 27.000,
+      "temp1_max": 75.000,
+      "temp1_max_hyst": 75.000,
+      "temp1_min": 0.000,
+      "temp1_crit": 97.000,
+      "temp1_crit_hyst": 97.000,
+      "temp1_max_alarm": 0.000,
+      "temp1_min_alarm": 0.000,
+      "temp1_crit_alarm": 0.000
+    }
+  },
+  "power_meter-acpi-0": {
+    "Adapter": "ACPI interface",
+    "power1": {
+      "power1_average_interval": 4294967.295
+    }
+  }
+}

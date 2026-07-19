@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+
+source venv/bin/activate
+
+API_KEY=""
+DATASET="tank/data"
+HOST="wss://nas.home.arpa/api/current"
+
+read -s -p "Enter password: " passphrase
+echo
+
+json=$(jq --null-input \
+  --arg dataset "$DATASET" \
+  --arg passphrase "$passphrase" \
+  '
+    {
+      "force": false,
+      "key_file": false,
+      "recursive": false,
+      "toggle_attachments": true,
+      "datasets": [
+        {
+          "name": $dataset,
+          "passphrase": $passphrase
+        }
+      ]
+    }
+  '
+)
+
+midclt -u "$HOST" -K "$API_KEY" call pool.dataset.unlock "$DATASET" "$json"
+sleep 3
+
+sudo mount /mnt/nas
+nohup find /mnt/nas -maxdepth 3 -type d &> /dev/null &
