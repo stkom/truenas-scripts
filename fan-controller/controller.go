@@ -272,11 +272,15 @@ type Controller struct {
 	driveZone  *controlledZone
 	drivePrev  driveSample
 	oldMode    int
+	dryRun     bool
 	mutation   sync.Mutex
 }
 
-func NewController(cfg *Config, hardware FanHardware, cpuReader CPUReader, driveReader DriveReader, logger *slog.Logger) *Controller {
+// NewController creates a controller. In dry-run mode the hardware is expected to skip writes,
+// so the controller also skips checks that compare hardware state with the duties it would have written.
+func NewController(cfg *Config, hardware FanHardware, cpuReader CPUReader, driveReader DriveReader, logger *slog.Logger, dryRun bool) *Controller {
 	controller := &Controller{
+		dryRun:     dryRun,
 		cfg:        cfg,
 		hardware:   hardware,
 		readCPU:    cpuReader,
@@ -350,6 +354,12 @@ func (controller *Controller) runDriveCycle(ctx context.Context) {
 }
 
 func (controller *Controller) runCPUCycle(ctx context.Context) {
+	if controller.dryRun {
+		if err := controller.updateCPU(ctx); err != nil {
+			controller.log.Error("CPU update failed", "event", "cpu_update_failed", "error", err)
+		}
+		return
+	}
 	if err := controller.ensureManualMode(ctx); err != nil {
 		controller.log.Error("fan mode verification failed", "event", "fan_mode_failed", "error", err)
 		controller.addFaultToBothZones(ctx, faultIPMI, "fan mode verification failure")
@@ -372,7 +382,9 @@ func (controller *Controller) start(ctx context.Context) error {
 		return fmt.Errorf("error reading initial fan mode: %w", err)
 	}
 	controller.oldMode = mode
-	if mode != controller.cfg.ManualMode {
+	if controller.dryRun {
+		controller.log.Info("dry run: fan mode, duty reconciliation and RPM checks are skipped", "event", "dry_run", "mode", mode)
+	} else if mode != controller.cfg.ManualMode {
 		if err := controller.setFanMode(ctx, controller.cfg.ManualMode); err != nil {
 			return fmt.Errorf("error enabling manual fan mode: %w", err)
 		}
@@ -407,6 +419,10 @@ func (controller *Controller) startFailure(ctx context.Context, cause error) err
 }
 
 func (controller *Controller) shutdown() {
+	if controller.dryRun {
+		controller.log.Info("dry run: no fan changes to undo", "event", "dry_run")
+		return
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*controller.cfg.IPMI.Timeout.Duration)
 	defer cancel()
 	if controller.cfg.RestoreModeOnExit && controller.oldMode != controller.cfg.ManualMode {
@@ -550,6 +566,9 @@ func (controller *Controller) clearFaultFromBothZones(ctx context.Context, fault
 }
 
 func (controller *Controller) verifyFanRPMs(ctx context.Context) error {
+	if controller.dryRun {
+		return nil
+	}
 	if !controller.cfg.CPU.Fan.RPMMonitor.Enabled && !controller.cfg.Drives.Fan.RPMMonitor.Enabled {
 		return nil
 	}

@@ -91,7 +91,7 @@ func setZoneState(zone *controlledZone, target, applied int) {
 }
 
 func newTestController(cfg *Config, hardware FanHardware, cpuReader CPUReader, driveReader DriveReader) *Controller {
-	return NewController(cfg, hardware, cpuReader, driveReader, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	return NewController(cfg, hardware, cpuReader, driveReader, slog.New(slog.NewTextHandler(io.Discard, nil)), false)
 }
 
 func TestCalculateCPUDuty(t *testing.T) {
@@ -548,5 +548,37 @@ func TestControllerDriveFailureKeepsPDTarget(t *testing.T) {
 	}
 	if want := 50 - int(cfg.Drives.Kp); hardware.duties[1] != want {
 		t.Errorf("hardware = %d after recovery, want %d", hardware.duties[1], want)
+	}
+}
+
+func TestControllerDryRunSkipsHardwareStateChecks(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Drives.Devices = []string{"/dev/sda"}
+	cfg.RPMSettleTime.Duration = 0
+	hardware := newFakeFanHardware()
+	hardware.mode = 2
+	hardware.duties[0] = 64
+	hardware.duties[1] = 64
+	hardware.rpms["FANA"] = 1100
+	controller := NewController(&cfg, hardware,
+		func(context.Context) (float64, string, error) { return 40, "test", nil },
+		func(context.Context, []string) []DriveReading {
+			return []DriveReading{{State: DriveActive, Temperature: cfg.Drives.SetpointC}}
+		},
+		slog.New(slog.NewTextHandler(io.Discard, nil)), true)
+	ctx := context.Background()
+
+	if err := controller.start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	controller.runCPUCycle(ctx)
+	controller.runDriveCycle(ctx)
+	controller.shutdown()
+
+	if len(hardware.modeWrites) != 0 {
+		t.Errorf("mode writes = %v, want none", hardware.modeWrites)
+	}
+	if controller.cpuZone.faults != 0 || controller.driveZone.faults != 0 {
+		t.Errorf("faults = %b/%b, want none", controller.cpuZone.faults, controller.driveZone.faults)
 	}
 }

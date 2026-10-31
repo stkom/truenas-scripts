@@ -52,7 +52,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	runner := OSCommandRunner{}
 	ipmi := NewIPMIClient(cfg.IPMI, runner, logger, *dryRun)
 	smartctl := NewSmartctlClient(cfg.Smartctl, cfg.Drives.MinimumTemperatureC, runner)
-	controller := NewController(cfg, ipmi, NewCPUReader(cfg.CPU, ipmi), smartctl.ReadTemperatures, logger)
+	controller := NewController(cfg, ipmi, NewCPUReader(cfg.CPU, ipmi), smartctl.ReadTemperatures, logger, *dryRun)
 	if err := controller.Run(ctx, *once); err != nil {
 		logger.Error("fan controller stopped", "event", "run_failed", "error", err)
 		return 1
