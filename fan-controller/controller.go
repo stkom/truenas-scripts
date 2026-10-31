@@ -75,6 +75,9 @@ func NewCPUReader(cfg CPUConfig, sensor TemperatureSensor) CPUReader {
 // unknownDuty marks a zone whose hardware duty is uncertain after a failed write.
 const unknownDuty = -1
 
+// maxUnstableRPMWaits bounds how often an RPM check waits for a changing duty before it is skipped.
+const maxUnstableRPMWaits = 6
+
 // zoneFault identifies a condition that overrides a zone's control target with the failure duty.
 type zoneFault uint8
 
@@ -95,10 +98,11 @@ type controlledZone struct {
 	log         *slog.Logger
 	mutation    *sync.Mutex
 
-	mu      sync.Mutex
-	target  int
-	applied int
-	faults  zoneFault
+	mu        sync.Mutex
+	target    int
+	applied   int
+	changedAt time.Time
+	faults    zoneFault
 }
 
 func newControlledZone(name string, cfg FanConfig, failureDuty int, hardware FanHardware, logger *slog.Logger, mutation *sync.Mutex) *controlledZone {
@@ -179,7 +183,11 @@ func (zone *controlledZone) writeLocked(ctx context.Context, duty int) error {
 	defer zone.mutation.Unlock()
 	if err := zone.hardware.SetZoneDuty(ctx, zone.cfg.Zone, duty); err != nil {
 		zone.applied = unknownDuty
+		zone.changedAt = time.Now()
 		return fmt.Errorf("error setting %s zone %d duty to %d: %w", zone.name, zone.cfg.Zone, duty, err)
+	}
+	if duty != zone.applied {
+		zone.changedAt = time.Now()
 	}
 	zone.applied = duty
 	return nil
@@ -211,6 +219,12 @@ func (zone *controlledZone) appliedDuty() int {
 	return zone.applied
 }
 
+func (zone *controlledZone) appliedState() (int, time.Time) {
+	zone.mu.Lock()
+	defer zone.mu.Unlock()
+	return zone.applied, zone.changedAt
+}
+
 func (zone *controlledZone) reconcile(ctx context.Context) error {
 	zone.mu.Lock()
 	defer zone.mu.Unlock()
@@ -235,11 +249,34 @@ func (zone *controlledZone) verifyRPM(ctx context.Context, retries int, settleTi
 	if !monitor.Enabled {
 		return nil
 	}
-	for attempt := 0; ; attempt++ {
-		duty := zone.appliedDuty()
+	// The duty may be changed concurrently by another control loop. Only compare RPM against a duty
+	// that has been stable for settleTime and did not change while the sensor was read.
+	unstableWaits := 0
+	waitForStableDuty := func(wait time.Duration) (bool, error) {
+		if unstableWaits >= maxUnstableRPMWaits {
+			zone.log.Warn("fan RPM check skipped; duty kept changing", "event", "rpm_check_skipped", "sensor", monitor.Sensor)
+			return false, nil
+		}
+		unstableWaits++
+		return true, waitFor(ctx, max(wait, time.Millisecond))
+	}
+	for attempt := 0; ; {
+		duty, changedAt := zone.appliedState()
+		if wait := settleTime - time.Since(changedAt); wait > 0 {
+			if retry, err := waitForStableDuty(wait); !retry || err != nil {
+				return err
+			}
+			continue
+		}
 		rpm, err := zone.hardware.ReadFanRPM(ctx, monitor.Sensor)
 		if err != nil {
 			return zone.rpmFailure(ctx, fmt.Errorf("error reading %s RPM: %w", monitor.Sensor, err))
+		}
+		if currentDuty, currentChangedAt := zone.appliedState(); currentDuty != duty || !currentChangedAt.Equal(changedAt) {
+			if retry, err := waitForStableDuty(settleTime); !retry || err != nil {
+				return err
+			}
+			continue
 		}
 		mismatch, reason := fanRPMMismatch(duty, rpm, monitor)
 		zone.log.Info("fan RPM checked", "event", "rpm_check", "sensor", monitor.Sensor, "rpm", rpm, "duty", duty, "mismatch", mismatch)
@@ -249,7 +286,8 @@ func (zone *controlledZone) verifyRPM(ctx context.Context, retries int, settleTi
 		if attempt >= retries {
 			return zone.rpmFailure(ctx, errors.New(reason))
 		}
-		zone.log.Warn("fan RPM mismatch; reapplying duty", "event", "rpm_mismatch", "sensor", monitor.Sensor, "rpm", rpm, "duty", duty, "attempt", attempt+1, "reason", reason)
+		attempt++
+		zone.log.Warn("fan RPM mismatch; reapplying duty", "event", "rpm_mismatch", "sensor", monitor.Sensor, "rpm", rpm, "duty", duty, "attempt", attempt, "reason", reason)
 		if err := zone.reapply(ctx); err != nil {
 			return zone.rpmFailure(ctx, err)
 		}

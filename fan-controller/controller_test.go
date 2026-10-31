@@ -28,6 +28,7 @@ type fakeFanHardware struct {
 	failingDuties map[int]bool
 	modeWrites    []int
 	dutyWrites    []dutyWrite
+	onReadRPM     func()
 }
 
 func newFakeFanHardware() *fakeFanHardware {
@@ -74,6 +75,9 @@ func (hardware *fakeFanHardware) SetZoneDuty(_ context.Context, zone, duty int) 
 }
 
 func (hardware *fakeFanHardware) ReadFanRPM(_ context.Context, sensor string) (float64, error) {
+	if hardware.onReadRPM != nil {
+		hardware.onReadRPM()
+	}
 	hardware.mu.Lock()
 	defer hardware.mu.Unlock()
 	return hardware.rpms[sensor], nil
@@ -623,5 +627,48 @@ func TestControllerDriveLoopPanicRestoresMode(t *testing.T) {
 	}
 	if hardware.mode != 0 {
 		t.Errorf("mode = %d after panic, want restored startup mode 0", hardware.mode)
+	}
+}
+
+func TestControlledZoneRPMCheckIgnoresDutyChangedDuringRead(t *testing.T) {
+	hardware := newFakeFanHardware()
+	hardware.rpms["FAN1"] = 500
+	zone := newTestZone(hardware, FanConfig{
+		Zone:       0,
+		RPMMonitor: RPMMonitorConfig{Enabled: true, Sensor: "FAN1", RPMAt30: 400, RPMAt100: 1400},
+	})
+	ctx := context.Background()
+	if _, err := zone.update(ctx, 40, 0); err != nil {
+		t.Fatal(err)
+	}
+	zone.changedAt = time.Time{}
+
+	// The RPM matches duty 40, but the CPU loop raises the duty while it is read.
+	reads := 0
+	hardware.onReadRPM = func() {
+		reads++
+		if reads == 1 {
+			if _, err := zone.update(ctx, 90, 0); err != nil {
+				t.Error(err)
+			}
+			return
+		}
+		hardware.mu.Lock()
+		hardware.rpms["FAN1"] = 1300
+		hardware.mu.Unlock()
+	}
+	settle := 20 * time.Millisecond
+	started := time.Now()
+	if err := zone.verifyRPM(ctx, 0, settle); err != nil {
+		t.Fatal(err)
+	}
+	if zone.faults != 0 {
+		t.Errorf("faults = %b, want none for a duty change during the read", zone.faults)
+	}
+	if reads != 2 {
+		t.Errorf("RPM reads = %d, want a second read after the new duty settled", reads)
+	}
+	if elapsed := time.Since(started); elapsed < settle {
+		t.Errorf("verifyRPM returned after %v, want a wait for the new duty to settle", elapsed)
 	}
 }
