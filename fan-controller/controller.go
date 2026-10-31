@@ -22,6 +22,13 @@ type DriveControlResult struct {
 	Derivative   float64
 }
 
+// driveSample is the previous drive control error used for the derivative term.
+type driveSample struct {
+	Error float64
+	At    time.Time
+	Valid bool
+}
+
 type FanHardware interface {
 	GetFanMode(context.Context) (int, error)
 	SetFanMode(context.Context, int) error
@@ -263,7 +270,7 @@ type Controller struct {
 	log        *slog.Logger
 	cpuZone    *controlledZone
 	driveZone  *controlledZone
-	driveErr   float64
+	drivePrev  driveSample
 	oldMode    int
 	mutation   sync.Mutex
 }
@@ -482,12 +489,13 @@ func (controller *Controller) updateDrives(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	result := calculateDriveDuty(controller.driveZone.currentTarget(), controller.driveErr, readings, controller.cfg.Drives)
+	now := time.Now()
+	result := calculateDriveDuty(controller.driveZone.currentTarget(), controller.drivePrev, now, readings, controller.cfg.Drives)
 	controller.logDriveIssues(readings)
 	if result.Failed > 0 || result.Active == 0 {
-		controller.driveErr = 0
+		controller.drivePrev = driveSample{}
 	} else {
-		controller.driveErr = result.Error
+		controller.drivePrev = driveSample{Error: result.Error, At: now, Valid: true}
 	}
 	var err error
 	if result.Failed > 0 {
@@ -601,8 +609,9 @@ func calculateCPUDuty(temperature float64, cfg CPUConfig) int {
 }
 
 // calculateDriveDuty applies the legacy spinpid2 PD step to the current target duty.
+// The derivative uses the measured time since the previous sample and is zero without one.
 // When any reading failed, Duty is left at the current target; the caller applies the failure duty.
-func calculateDriveDuty(current int, previousError float64, readings []DriveReading, cfg DriveConfig) DriveControlResult {
+func calculateDriveDuty(current int, previous driveSample, now time.Time, readings []DriveReading, cfg DriveConfig) DriveControlResult {
 	result := DriveControlResult{Duty: current}
 	var temperatures []float64
 	for _, reading := range readings {
@@ -630,8 +639,9 @@ func calculateDriveDuty(current int, previousError float64, readings []DriveRead
 	result.Maximum = maxFloat(temperatures)
 	result.Error = result.Mean - cfg.SetpointC
 	result.Proportional = cfg.Kp * result.Error
-	minutes := cfg.PollInterval.Duration.Minutes()
-	result.Derivative = cfg.Kd * (result.Error - previousError) / minutes
+	if minutes := now.Sub(previous.At).Minutes(); previous.Valid && minutes > 0 {
+		result.Derivative = cfg.Kd * (result.Error - previous.Error) / minutes
+	}
 	demand := float64(current) + result.Proportional + result.Derivative
 	result.Duty = clampFloatDuty(math.Round(demand), cfg.Fan)
 	return result

@@ -1,6 +1,6 @@
 # Fan controller
 
-Dual-zone Supermicro IPMI fan controller for TrueNAS SCALE. CPU duty follows package temperature. Drive duty uses the legacy `spinpid2` proportional/derivative calculation over mean temperature.
+Dual-zone Supermicro IPMI fan controller for TrueNAS SCALE. CPU duty follows package temperature. Drive duty uses the legacy `spinpid2` proportional/derivative calculation over mean temperature. The derivative uses the measured time between samples and is zero for the first sample after startup, a drive failure, or all drives in standby.
 
 ## Safety
 

@@ -125,7 +125,7 @@ func TestDutyCalculationsSaturateBeforeIntegerConversion(t *testing.T) {
 	driveCfg := DefaultConfig().Drives
 	driveCfg.Kp = math.MaxFloat64
 	driveCfg.Kd = 0
-	result := calculateDriveDuty(50, 0, []DriveReading{{State: DriveActive, Temperature: driveCfg.SetpointC + 1}}, driveCfg)
+	result := calculateDriveDuty(50, driveSample{}, time.Now(), []DriveReading{{State: DriveActive, Temperature: driveCfg.SetpointC + 1}}, driveCfg)
 	if result.Duty != driveCfg.Fan.MaxDuty {
 		t.Errorf("drive duty = %d, want maximum %d", result.Duty, driveCfg.Fan.MaxDuty)
 	}
@@ -142,7 +142,9 @@ func TestCalculateDriveDutyMatchesLegacyPDMath(t *testing.T) {
 		{Device: "/dev/sdb", State: DriveActive, Temperature: 38},
 	}
 
-	result := calculateDriveDuty(50, 0, readings, cfg)
+	now := time.Now()
+	previous := driveSample{Error: 0, At: now.Add(-5 * time.Minute), Valid: true}
+	result := calculateDriveDuty(50, previous, now, readings, cfg)
 	if result.Mean != 37 || result.Maximum != 38 {
 		t.Errorf("temperatures mean/max = %v/%v, want 37/38", result.Mean, result.Maximum)
 	}
@@ -154,15 +156,31 @@ func TestCalculateDriveDutyMatchesLegacyPDMath(t *testing.T) {
 	}
 }
 
+func TestCalculateDriveDutyDerivative(t *testing.T) {
+	cfg := DefaultConfig().Drives
+	readings := []DriveReading{{State: DriveActive, Temperature: cfg.SetpointC + 3}}
+	now := time.Now()
+
+	first := calculateDriveDuty(50, driveSample{}, now, readings, cfg)
+	if first.Derivative != 0 || first.Duty != 62 {
+		t.Errorf("first sample D/duty = %v/%d, want 0/62", first.Derivative, first.Duty)
+	}
+
+	slow := calculateDriveDuty(50, driveSample{Error: 1, At: now.Add(-10 * time.Minute), Valid: true}, now, readings, cfg)
+	if slow.Derivative != 8 {
+		t.Errorf("derivative over 10 minutes = %v, want 8", slow.Derivative)
+	}
+}
+
 func TestCalculateDriveDutyHandlesStandbyAndFailure(t *testing.T) {
 	cfg := DefaultConfig().Drives
 
-	standby := calculateDriveDuty(50, 2, []DriveReading{{State: DriveStandby}}, cfg)
+	standby := calculateDriveDuty(50, driveSample{Error: 2, Valid: true}, time.Now(), []DriveReading{{State: DriveStandby}}, cfg)
 	if standby.Duty != cfg.Fan.MinDuty {
 		t.Errorf("standby duty = %d, want %d", standby.Duty, cfg.Fan.MinDuty)
 	}
 
-	failed := calculateDriveDuty(50, 2, []DriveReading{{State: DriveFailed}}, cfg)
+	failed := calculateDriveDuty(50, driveSample{Error: 2, Valid: true}, time.Now(), []DriveReading{{State: DriveFailed}}, cfg)
 	if failed.Failed != 1 || failed.Duty != 50 {
 		t.Errorf("failed result = %+v, want one failure and unchanged target 50", failed)
 	}
