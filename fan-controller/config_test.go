@@ -138,3 +138,16 @@ func TestExampleConfigIsValid(t *testing.T) {
 		t.Fatalf("LoadConfig(example) error = %v", err)
 	}
 }
+
+func TestConfigRejectsMaximumDriveTemperatureNearSetpoint(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Drives.Devices = []string{"/dev/sda"}
+	cfg.Drives.MaximumTemperatureC = cfg.Drives.SetpointC + 1
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "maximum_temperature_c") {
+		t.Fatalf("Validate() error = %v, want maximum_temperature_c error", err)
+	}
+	cfg.Drives.MaximumTemperatureC = 0
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() with disabled maximum error = %v", err)
+	}
+}

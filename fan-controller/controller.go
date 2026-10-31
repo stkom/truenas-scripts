@@ -85,7 +85,11 @@ const (
 	faultSensor zoneFault = 1 << iota
 	faultIPMI
 	faultRPM
+	faultHot
 )
+
+// hotDriveHysteresisC is how far the hottest drive must fall below maximum_temperature_c to clear the override.
+const hotDriveHysteresisC = 2.0
 
 // controlledZone separates the control algorithm's target from the duty written to hardware.
 // Any active fault writes the failure duty without disturbing the target, so control resumes
@@ -570,13 +574,7 @@ func (controller *Controller) updateDrives(ctx context.Context) error {
 	} else {
 		controller.drivePrev = driveSample{Error: result.Error, At: now, Valid: true}
 	}
-	var err error
-	if result.Failed > 0 {
-		err = controller.driveZone.addFault(ctx, faultSensor, "drive sensor failure")
-	} else {
-		_, err = controller.driveZone.update(ctx, result.Duty, faultSensor)
-	}
-	if err != nil {
+	if err := controller.applyDriveResult(ctx, result); err != nil {
 		return err
 	}
 	controller.log.Info("drive fans updated",
@@ -593,6 +591,28 @@ func (controller *Controller) updateDrives(ctx context.Context) error {
 		"duty", controller.driveZone.appliedDuty(),
 	)
 	return nil
+}
+
+// applyDriveResult writes the PD target and manages the sensor and hot-drive faults.
+func (controller *Controller) applyDriveResult(ctx context.Context, result DriveControlResult) error {
+	zone := controller.driveZone
+	if result.Failed > 0 {
+		return zone.addFault(ctx, faultSensor, "drive sensor failure")
+	}
+	limit := controller.cfg.Drives.MaximumTemperatureC
+	clears := faultSensor
+	if limit <= 0 || result.Active == 0 || result.Maximum < limit-hotDriveHysteresisC {
+		clears |= faultHot
+	}
+	// Add the hot fault before updating the target so the zone goes straight to failure duty.
+	if limit > 0 && result.Active > 0 && result.Maximum >= limit {
+		reason := fmt.Sprintf("hottest drive %.0f°C at or above maximum %.0f°C", result.Maximum, limit)
+		if err := zone.addFault(ctx, faultHot, reason); err != nil {
+			return err
+		}
+	}
+	_, err := zone.update(ctx, result.Duty, clears)
+	return err
 }
 
 func (controller *Controller) logDriveIssues(readings []DriveReading) {

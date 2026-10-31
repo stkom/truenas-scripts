@@ -672,3 +672,43 @@ func TestControlledZoneRPMCheckIgnoresDutyChangedDuringRead(t *testing.T) {
 		t.Errorf("verifyRPM returned after %v, want a wait for the new duty to settle", elapsed)
 	}
 }
+
+func TestControllerHotDriveOverridesMeanControl(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Drives.Devices = []string{"/dev/sda", "/dev/sdb", "/dev/sdc"}
+	cfg.Drives.Kp = 0
+	cfg.Drives.Kd = 0
+	hardware := newFakeFanHardware()
+	var hottest float64
+	controller := newTestController(&cfg, hardware, nil,
+		func(context.Context, []string) []DriveReading {
+			return []DriveReading{
+				{State: DriveActive, Temperature: 33},
+				{State: DriveActive, Temperature: 33},
+				{State: DriveActive, Temperature: hottest},
+			}
+		},
+	)
+	setZoneState(controller.driveZone, 40, 40)
+	hardware.duties[1] = 40
+	ctx := context.Background()
+
+	steps := []struct {
+		hottest float64
+		want    int
+	}{
+		{hottest: 44, want: 40},
+		{hottest: 45, want: 100},
+		{hottest: 44, want: 100},
+		{hottest: 42.9, want: 40},
+	}
+	for _, step := range steps {
+		hottest = step.hottest
+		if err := controller.updateDrives(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if hardware.duties[1] != step.want {
+			t.Errorf("hottest %v°C: duty = %d, want %d", step.hottest, hardware.duties[1], step.want)
+		}
+	}
+}

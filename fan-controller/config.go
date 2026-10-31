@@ -66,6 +66,7 @@ type DriveConfig struct {
 	PollInterval        Duration  `json:"poll_interval"`
 	SetpointC           float64   `json:"setpoint_c"`
 	MinimumTemperatureC float64   `json:"minimum_temperature_c"`
+	MaximumTemperatureC float64   `json:"maximum_temperature_c"`
 	Kp                  float64   `json:"kp"`
 	Kd                  float64   `json:"kd"`
 }
@@ -125,6 +126,7 @@ func DefaultConfig() Config {
 			PollInterval:        Duration{5 * time.Minute},
 			SetpointC:           36,
 			MinimumTemperatureC: 5,
+			MaximumTemperatureC: 45,
 			Kp:                  4,
 			Kd:                  40,
 		},
@@ -216,6 +218,10 @@ func (cfg *Config) Validate() error {
 	}
 	if err := validateControlTemperature("drives.setpoint_c", cfg.Drives.SetpointC, cfg.Drives.MinimumTemperatureC); err != nil {
 		return err
+	}
+	if cfg.Drives.MaximumTemperatureC != 0 &&
+		!(cfg.Drives.MaximumTemperatureC > cfg.Drives.SetpointC+hotDriveHysteresisC && cfg.Drives.MaximumTemperatureC <= maximumValidTemperature) {
+		return fmt.Errorf("drives.maximum_temperature_c must be 0 (disabled) or above setpoint_c + %g and at most %d", hotDriveHysteresisC, maximumValidTemperature)
 	}
 	if !(cfg.Drives.Kp >= 0 && cfg.Drives.Kp <= maximumControlGain) {
 		return fmt.Errorf("drives.kp must be between 0 and %.0f", maximumControlGain)

@@ -51,6 +51,7 @@
     "poll_interval": "5m",
     "setpoint_c": 36,
     "minimum_temperature_c": 5,
+    "maximum_temperature_c": 45,
     "kp": 4,
     "kd": 40
   },

@@ -6,6 +6,7 @@ Dual-zone Supermicro IPMI fan controller for TrueNAS SCALE. CPU duty follows pac
 
 - Invalid CPU reading sets the CPU zone to `safety.failure_duty`.
 - Any configured drive with an invalid reading sets the drive zone to `safety.failure_duty`.
+- If the hottest active drive reaches `drives.maximum_temperature_c` (default 45°C, `0` disables), the drive zone uses `safety.failure_duty` until that drive falls 2°C below the limit. Control otherwise follows mean temperature, which can hide one hot drive.
 - Persistent fan RPM mismatch sets the affected zone to `safety.failure_duty` until a later check passes.
 - RPM checks only compare against a duty that has been stable for `rpm_settle_time`. If the duty keeps changing, as the CPU zone can, the check is skipped and logged instead of failing.
 - IPMI read failures during the CPU cycle set both zones to `safety.failure_duty` until the next successful cycle.
