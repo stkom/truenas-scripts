@@ -1,35 +1,309 @@
-#!/usr/bin/env bash
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#     "truenas_api_client @ git+https://github.com/truenas/api_client.git@77d13be242af5b6cdc0fbec3b3b02f40586aa95f",
+# ]
+# ///
+"""Unlock an encrypted TrueNAS dataset, mount its share and warm the directory cache."""
 
-source venv/bin/activate
+import argparse
+import getpass
+import os
+import ssl
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
 
-API_KEY=""
-DATASET="tank/data"
-HOST="wss://nas.home.arpa/api/current"
+from truenas_api_client import Client, ClientException, ValidationErrors
 
-read -s -p "Enter password: " passphrase
-echo
+DEFAULT_HOST = "nas.home.arpa"
+DEFAULT_DATASET = "tank/data"
+DEFAULT_MOUNTPOINT = "/mnt/nas"
+DEFAULT_API_KEY_FILE = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "unlock-nas" / "api-key"
 
-json=$(jq --null-input \
-  --arg dataset "$DATASET" \
-  --arg passphrase "$passphrase" \
-  '
-    {
-      "force": false,
-      "key_file": false,
-      "recursive": false,
-      "toggle_attachments": true,
-      "datasets": [
-        {
-          "name": $dataset,
-          "passphrase": $passphrase
+MAX_PROMPT_ATTEMPTS = 3
+# Unlocking restarts the SMB share, so the first mount attempts may fail.
+MOUNT_ATTEMPTS = 10
+MOUNT_RETRY_DELAY = 2  # seconds
+WARM_CACHE_DEPTH = 3
+# Error reported by the middleware for a wrong passphrase.
+INVALID_KEY_ERROR = "Invalid Key"
+
+
+class Fatal(Exception):
+    """Aborts the script with a message."""
+
+
+class AuthenticationError(Fatal):
+    """The NAS rejected the API key."""
+
+
+def use_color(stream) -> bool:
+    return stream.isatty() and "NO_COLOR" not in os.environ and os.environ.get("TERM") != "dumb"
+
+
+def styled(stream, code: str, text: str) -> str:
+    return f"\033[{code}m{text}\033[0m" if use_color(stream) else text
+
+
+def step(message: str) -> None:
+    print(f"{styled(sys.stdout, '1;34', '::')} {message}", flush=True)
+
+
+def ok(message: str) -> None:
+    print(f"{styled(sys.stdout, '1;32', ' ✓')} {message}", flush=True)
+
+
+def warn(message: str) -> None:
+    print(f"{styled(sys.stderr, '1;33', ' !')} {message}", file=sys.stderr, flush=True)
+
+
+def error(message: str) -> None:
+    print(f"{styled(sys.stderr, '1;31', 'error:')} {message}", file=sys.stderr, flush=True)
+
+
+def confirm(question: str, default: bool) -> bool:
+    answer = input(f"{question} [{'Y/n' if default else 'y/N'}] ").strip().lower()
+    return default if not answer else answer in ("y", "yes")
+
+
+def read_secret(prompt: str) -> str:
+    while not (secret := getpass.getpass(prompt).strip()):
+        warn("Input must not be empty")
+    return secret
+
+
+def find_api_key(key_file: Path) -> str | None:
+    """Return the API key from the environment or the key file, or None if neither is set."""
+    if key := os.environ.get("TRUENAS_API_KEY", "").strip():
+        return key
+
+    try:
+        mode = key_file.stat().st_mode
+        key = key_file.read_text().strip()
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        raise Fatal(f"Cannot read API key file {key_file}: {e.strerror}") from None
+
+    if mode & (stat.S_IRWXG | stat.S_IRWXO):
+        warn(f"{key_file} is accessible by other users, restrict it with: chmod 600 {key_file}")
+    if not key:
+        raise Fatal(f"API key file {key_file} is empty, store a key with --set-api-key")
+    return key
+
+
+def save_api_key(key_file: Path, key: str) -> None:
+    try:
+        key_file.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        # mkstemp creates the file readable by the owner only; replacing makes the write atomic.
+        fd, tmp_path = tempfile.mkstemp(dir=key_file.parent, prefix=f".{key_file.name}.")
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write(f"{key}\n")
+            os.replace(tmp_path, key_file)
+        except BaseException:
+            os.unlink(tmp_path)
+            raise
+    except OSError as e:
+        raise Fatal(f"Cannot write API key file {key_file}: {e.strerror}") from None
+
+
+def set_up_api_key(args: argparse.Namespace) -> str:
+    """Ask for an API key, verify it with the NAS and store it in the key file."""
+    print(f"Create an API key in the TrueNAS web UI ({args.host}) under user menu → My API Keys.")
+    for attempt in range(1, MAX_PROMPT_ATTEMPTS + 1):
+        key = read_secret("API key: ")
+        step(f"Verifying API key with {args.host}")
+        try:
+            with connect(args.host, verify_ssl=not args.insecure) as client:
+                authenticate(client, args.user, key)
+        except AuthenticationError as e:
+            if attempt == MAX_PROMPT_ATTEMPTS:
+                raise
+            warn(f"{e}, try again")
+            continue
+
+        save_api_key(args.api_key_file, key)
+        ok(f"Stored API key in {args.api_key_file}")
+        return key
+    raise AssertionError("unreachable")
+
+
+def connect(host: str, verify_ssl: bool) -> Client:
+    uri = f"wss://{host}/api/current"
+    try:
+        return Client(uri, verify_ssl=verify_ssl)
+    except ssl.SSLCertVerificationError as e:
+        raise Fatal(f"TLS certificate of {host} could not be verified ({e.verify_message.rstrip('.')}), see --insecure") from None
+    except Exception as e:
+        # The client surfaces DNS, socket, TLS and websocket failures as different exception types.
+        raise Fatal(f"Cannot connect to {uri}: {e or type(e).__name__}") from None
+
+
+def authenticate(client, username: str, api_key: str) -> None:
+    try:
+        client.login_with_api_key(username, api_key)
+    except (ValueError, ClientException) as e:
+        raise AuthenticationError(f"Authentication failed: {e}") from None
+
+
+def is_locked(client, dataset: str) -> bool:
+    try:
+        result = client.call("pool.dataset.query", [["id", "=", dataset]], {"extra": {"retrieve_children": False}})
+    except ClientException as e:
+        raise Fatal(f"Cannot look up dataset {dataset}: {e}") from None
+
+    if not result:
+        raise Fatal(f"Dataset {dataset} does not exist")
+    if not result[0]["encrypted"]:
+        raise Fatal(f"Dataset {dataset} is not encrypted")
+    return result[0]["locked"]
+
+
+def unlock(client, dataset: str) -> None:
+    for attempt in range(1, MAX_PROMPT_ATTEMPTS + 1):
+        options = {
+            "force": False,
+            "key_file": False,
+            "recursive": False,
+            "toggle_attachments": True,
+            "datasets": [{"name": dataset, "passphrase": read_secret(f"Passphrase for {dataset}: ")}],
         }
-      ]
-    }
-  '
-)
+        step(f"Unlocking {dataset}")
+        try:
+            result = client.call("pool.dataset.unlock", dataset, options, job=True)
+        except ValidationErrors as e:
+            raise Fatal(f"Unlock request was rejected:\n{e}") from None
+        except ClientException as e:
+            raise Fatal(f"Unlocking {dataset} failed: {e}") from None
 
-midclt -u "$HOST" -K "$API_KEY" call pool.dataset.unlock "$DATASET" "$json"
-sleep 3
+        if dataset in result["unlocked"]:
+            return
 
-sudo mount /mnt/nas
-nohup find /mnt/nas -maxdepth 3 -type d &> /dev/null &
+        reason = (result["failed"].get(dataset) or {}).get("error") or "unknown error"
+        if reason != INVALID_KEY_ERROR:
+            raise Fatal(f"Unlocking {dataset} failed: {reason}")
+        if (left := MAX_PROMPT_ATTEMPTS - attempt) > 0:
+            warn(f"Wrong passphrase, try again ({left} {'attempt' if left == 1 else 'attempts'} left)")
+
+    raise Fatal(f"Wrong passphrase, giving up after {MAX_PROMPT_ATTEMPTS} attempts")
+
+
+def mount(mountpoint: str) -> None:
+    if os.path.ismount(mountpoint):
+        ok(f"{mountpoint} is already mounted")
+        return
+
+    step(f"Mounting {mountpoint}")
+    # Authenticate sudo once up front, so the retries below never prompt.
+    if subprocess.run(["sudo", "--validate"]).returncode != 0:
+        raise Fatal("sudo authentication failed")
+
+    for attempt in range(1, MOUNT_ATTEMPTS + 1):
+        proc = subprocess.run(["sudo", "--non-interactive", "mount", mountpoint], capture_output=True, text=True)
+        if proc.returncode == 0:
+            ok(f"Mounted {mountpoint}")
+            return
+        if attempt < MOUNT_ATTEMPTS:
+            time.sleep(MOUNT_RETRY_DELAY)
+
+    raise Fatal(f"Mounting {mountpoint} failed after {MOUNT_ATTEMPTS} attempts: {proc.stderr.strip()}")
+
+
+def warm_cache(mountpoint: str) -> None:
+    """Walk the top directory levels in the background, so browsing the share is fast afterwards."""
+    subprocess.Popen(
+        ["find", mountpoint, "-maxdepth", str(WARM_CACHE_DEPTH), "-type", "d"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    ok(f"Warming directory cache of {mountpoint} in the background")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        epilog=(
+            "The API key is read from the TRUENAS_API_KEY environment variable "
+            f"or from the key file (default: {DEFAULT_API_KEY_FILE}). "
+            "If neither is set, the script offers to store a key on first run."
+        ),
+    )
+    parser.add_argument(
+        "--set-api-key", action="store_true", help="verify and store a new API key in the key file, then exit"
+    )
+    parser.add_argument("--host", default=DEFAULT_HOST, help="TrueNAS host name (default: %(default)s)")
+    parser.add_argument("--dataset", default=DEFAULT_DATASET, help="encrypted dataset to unlock (default: %(default)s)")
+    parser.add_argument(
+        "--mountpoint", default=DEFAULT_MOUNTPOINT, help="local fstab mount point of the share (default: %(default)s)"
+    )
+    parser.add_argument("--api-key-file", type=Path, default=DEFAULT_API_KEY_FILE, help="file containing the API key")
+    parser.add_argument(
+        "--user",
+        default=os.environ.get("TRUENAS_USER", ""),
+        help="user owning the API key, enables SCRAM authentication (default: $TRUENAS_USER)",
+    )
+    parser.add_argument("--insecure", action="store_true", help="do not verify the TLS certificate of the host")
+    parser.add_argument("--no-mount", action="store_true", help="only unlock the dataset")
+    parser.add_argument("--no-warm-cache", action="store_true", help="do not warm the directory cache after mounting")
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    try:
+        if args.set_api_key:
+            if os.environ.get("TRUENAS_API_KEY", "").strip():
+                warn("TRUENAS_API_KEY is set and takes precedence over the key file")
+            if args.api_key_file.exists() and not confirm(f"{args.api_key_file} already exists. Replace it?", False):
+                ok("Kept the existing API key")
+                return 0
+            set_up_api_key(args)
+            return 0
+
+        api_key = find_api_key(args.api_key_file)
+        if api_key is None:
+            missing = f"No API key found in TRUENAS_API_KEY or {args.api_key_file}"
+            if not sys.stdin.isatty():
+                raise Fatal(f"{missing}, store one with --set-api-key")
+            warn(missing)
+            if not confirm("Set up an API key now?", True):
+                raise Fatal("An API key is required, store one with --set-api-key")
+            api_key = set_up_api_key(args)
+
+        step(f"Connecting to {args.host}")
+        with connect(args.host, verify_ssl=not args.insecure) as client:
+            authenticate(client, args.user, api_key)
+            if is_locked(client, args.dataset):
+                unlock(client, args.dataset)
+                ok(f"Unlocked {args.dataset}")
+            else:
+                ok(f"{args.dataset} is already unlocked")
+
+        if not args.no_mount:
+            mount(args.mountpoint)
+            if not args.no_warm_cache:
+                warm_cache(args.mountpoint)
+    except Fatal as e:
+        error(str(e))
+        return 1
+    except EOFError:
+        print(file=sys.stderr)
+        error("No input, aborting")
+        return 1
+    except KeyboardInterrupt:
+        print(file=sys.stderr)
+        error("Interrupted")
+        return 130
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
