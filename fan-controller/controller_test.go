@@ -582,3 +582,46 @@ func TestControllerDryRunSkipsHardwareStateChecks(t *testing.T) {
 		t.Errorf("faults = %b/%b, want none", controller.cpuZone.faults, controller.driveZone.faults)
 	}
 }
+
+func TestControllerShutdownUsesConfiguredRestoreMode(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Drives.Devices = []string{"/dev/sda"}
+	restoreMode := 2
+	cfg.RestoreMode = &restoreMode
+	hardware := newFakeFanHardware()
+	hardware.mode = cfg.ManualMode
+	controller := newTestController(&cfg, hardware, nil, nil)
+	controller.oldMode = cfg.ManualMode
+
+	controller.shutdown()
+	if hardware.mode != 2 {
+		t.Errorf("shutdown mode = %d, want configured restore mode 2", hardware.mode)
+	}
+}
+
+func TestControllerDriveLoopPanicRestoresMode(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Drives.Devices = []string{"/dev/sda"}
+	cfg.ModeSettleTime.Duration = 0
+	cfg.ReadDuty = false
+	hardware := newFakeFanHardware()
+	hardware.mode = 0
+	controller := newTestController(&cfg, hardware,
+		func(context.Context) (float64, string, error) { return 40, "test", nil },
+		func(context.Context, []string) []DriveReading { panic("boom") },
+	)
+
+	done := make(chan error, 1)
+	go func() { done <- controller.Run(context.Background(), false) }()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("Run() error is nil after drive loop panic")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("controller did not stop after drive loop panic")
+	}
+	if hardware.mode != 0 {
+		t.Errorf("mode = %d after panic, want restored startup mode 0", hardware.mode)
+	}
+}

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"runtime/debug"
 	"sync"
 	"time"
 )
@@ -308,7 +309,15 @@ func (controller *Controller) Run(ctx context.Context, once bool) error {
 
 	runCtx, cancel := context.WithCancel(ctx)
 	var driveWorker sync.WaitGroup
+	driveFailed := make(chan error, 1)
 	driveWorker.Go(func() {
+		// A panic here would otherwise kill the process without restoring the fan mode.
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				controller.log.Error("drive loop panicked", "event", "drive_loop_panic", "panic", recovered, "stack", string(debug.Stack()))
+				driveFailed <- fmt.Errorf("drive loop panicked: %v", recovered)
+			}
+		}()
 		controller.runDriveLoop(runCtx)
 	})
 	defer func() {
@@ -323,6 +332,8 @@ func (controller *Controller) Run(ctx context.Context, once bool) error {
 		select {
 		case <-ctx.Done():
 			return nil
+		case err := <-driveFailed:
+			return err
 		case <-cpuTicker.C:
 			if ctx.Err() != nil {
 				return nil
@@ -382,6 +393,10 @@ func (controller *Controller) start(ctx context.Context) error {
 		return fmt.Errorf("error reading initial fan mode: %w", err)
 	}
 	controller.oldMode = mode
+	if controller.cfg.RestoreModeOnExit && controller.cfg.RestoreMode == nil && mode == controller.cfg.ManualMode {
+		controller.log.Warn("fan mode is already manual at startup; set restore_mode to restore an automatic mode on exit",
+			"event", "restore_mode_unknown", "mode", mode)
+	}
 	if controller.dryRun {
 		controller.log.Info("dry run: fan mode, duty reconciliation and RPM checks are skipped", "event", "dry_run", "mode", mode)
 	} else if mode != controller.cfg.ManualMode {
@@ -425,9 +440,13 @@ func (controller *Controller) shutdown() {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*controller.cfg.IPMI.Timeout.Duration)
 	defer cancel()
-	if controller.cfg.RestoreModeOnExit && controller.oldMode != controller.cfg.ManualMode {
-		if err := controller.setFanMode(ctx, controller.oldMode); err == nil {
-			controller.log.Info("fan mode restored", "event", "fan_mode_restored", "mode", controller.oldMode)
+	restoreMode := controller.oldMode
+	if controller.cfg.RestoreMode != nil {
+		restoreMode = *controller.cfg.RestoreMode
+	}
+	if controller.cfg.RestoreModeOnExit && restoreMode != controller.cfg.ManualMode {
+		if err := controller.setFanMode(ctx, restoreMode); err == nil {
+			controller.log.Info("fan mode restored", "event", "fan_mode_restored", "mode", restoreMode)
 			return
 		} else {
 			controller.log.Error("fan mode restoration failed", "event", "fan_mode_restore_failed", "error", err)

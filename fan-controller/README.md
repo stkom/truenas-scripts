@@ -10,7 +10,8 @@ Dual-zone Supermicro IPMI fan controller for TrueNAS SCALE. CPU duty follows pac
 - IPMI read failures during the CPU cycle set both zones to `safety.failure_duty` until the next successful cycle.
 - Failure duty overrides the control target without replacing it. Once every fault on a zone clears, control resumes from its previous target.
 - Standby drives are not woken. If every drive is in standby, drive duty becomes its configured minimum.
-- SIGINT/SIGTERM restores the automatic BMC mode present at startup. If no automatic mode can be restored, both zones are set to `safety.failure_duty`.
+- SIGINT/SIGTERM restores `restore_mode`, or the BMC mode present at startup when `restore_mode` is `null`. If no automatic mode can be restored, both zones are set to `safety.failure_duty`.
+- A panic in the drive loop stops the controller through the normal shutdown path, so the fan mode is still restored.
 - `--dry-run` reads sensors and logs the duties it would set, but skips all IPMI writes. It also skips fan mode checks, duty reconciliation and RPM verification, because the BMC keeps controlling the fans.
 - With `read_duty` enabled, each CPU cycle detects and corrects BMC duty resets. This corresponds to legacy `HOW_DUTY=1`.
 - Each CPU cycle also restores externally changed fan mode, waits for the BMC, then forcibly reapplies both zone duties.
@@ -45,6 +46,8 @@ File logs rotate before exceeding `log_max_size_mb`. `log_backups` controls how 
 RPM calibration retains the old config values. CPU RPM monitoring defaults off, matching the disabled check in the working shell script. Automatic BMC cold reset is intentionally omitted.
 
 The example uses the current NAS devices and a tested 30% CPU minimum. At 20%, FAN2 reached its 300 RPM critical threshold and the BMC repeatedly forced both zones to 100%.
+
+Set `restore_mode` to the automatic Supermicro mode to return to on exit (0 Standard, 2 Optimal, 4 Heavy IO). Without it, the controller restores the mode it found at startup. After a crash and restart that mode is already manual, so a later clean exit leaves the fans at failure duty.
 
 `ipmi.args` supports additional global `ipmitool` arguments. Avoid command-line passwords; they can be exposed through process listings.
 

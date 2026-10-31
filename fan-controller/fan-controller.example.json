@@ -63,6 +63,7 @@
   "manual_mode": 1,
   "initial_duty": 50,
   "restore_mode_on_exit": true,
+  "restore_mode": null,
   "mode_settle_time": "5s",
   "read_duty": true,
   "rpm_settle_time": "5s",

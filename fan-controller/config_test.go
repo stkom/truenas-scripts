@@ -123,3 +123,18 @@ func TestConfigRejectsUnsafeControlValues(t *testing.T) {
 		})
 	}
 }
+
+func TestConfigRejectsRestoreModeEqualToManualMode(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Drives.Devices = []string{"/dev/sda"}
+	cfg.RestoreMode = &cfg.ManualMode
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "restore_mode") {
+		t.Fatalf("Validate() error = %v, want restore_mode error", err)
+	}
+}
+
+func TestExampleConfigIsValid(t *testing.T) {
+	if _, err := LoadConfig("fan-controller.example.json"); err != nil {
+		t.Fatalf("LoadConfig(example) error = %v", err)
+	}
+}

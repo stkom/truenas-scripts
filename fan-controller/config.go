@@ -86,6 +86,7 @@ type Config struct {
 	ManualMode        int           `json:"manual_mode"`
 	InitialDuty       int           `json:"initial_duty"`
 	RestoreModeOnExit bool          `json:"restore_mode_on_exit"`
+	RestoreMode       *int          `json:"restore_mode"`
 	RPMSettleTime     Duration      `json:"rpm_settle_time"`
 	RPMRetries        int           `json:"rpm_retries"`
 	ModeSettleTime    Duration      `json:"mode_settle_time"`
@@ -254,6 +255,14 @@ func (cfg *Config) Validate() error {
 	}
 	if cfg.ManualMode < 0 || cfg.ManualMode > 255 {
 		return errors.New("manual_mode must be between 0 and 255")
+	}
+	if cfg.RestoreMode != nil {
+		if *cfg.RestoreMode < 0 || *cfg.RestoreMode > 255 {
+			return errors.New("restore_mode must be between 0 and 255")
+		}
+		if *cfg.RestoreMode == cfg.ManualMode {
+			return errors.New("restore_mode must differ from manual_mode")
+		}
 	}
 	if cfg.RPMSettleTime.Duration < 0 {
 		return errors.New("rpm_settle_time cannot be negative")
