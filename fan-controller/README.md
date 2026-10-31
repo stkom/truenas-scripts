@@ -6,7 +6,9 @@ Dual-zone Supermicro IPMI fan controller for TrueNAS SCALE. CPU duty follows pac
 
 - Invalid CPU reading sets the CPU zone to `safety.failure_duty`.
 - Any configured drive with an invalid reading sets the drive zone to `safety.failure_duty`.
-- Persistent fan RPM mismatch sets the affected zone to `safety.failure_duty`.
+- Persistent fan RPM mismatch sets the affected zone to `safety.failure_duty` until a later check passes.
+- IPMI read failures during the CPU cycle set both zones to `safety.failure_duty` until the next successful cycle.
+- Failure duty overrides the control target without replacing it. Once every fault on a zone clears, control resumes from its previous target.
 - Standby drives are not woken. If every drive is in standby, drive duty becomes its configured minimum.
 - SIGINT/SIGTERM restores the automatic BMC mode present at startup. If no automatic mode can be restored, both zones are set to `safety.failure_duty`.
 - `--dry-run` reads hardware but skips all IPMI writes.

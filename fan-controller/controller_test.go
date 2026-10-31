@@ -79,6 +79,17 @@ func (hardware *fakeFanHardware) ReadFanRPM(_ context.Context, sensor string) (f
 	return hardware.rpms[sensor], nil
 }
 
+func newTestZone(hardware FanHardware, cfg FanConfig) *controlledZone {
+	return newControlledZone("test", cfg, 100, hardware, slog.New(slog.NewTextHandler(io.Discard, nil)), &sync.Mutex{})
+}
+
+func setZoneState(zone *controlledZone, target, applied int) {
+	zone.mu.Lock()
+	defer zone.mu.Unlock()
+	zone.target = target
+	zone.applied = applied
+}
+
 func newTestController(cfg *Config, hardware FanHardware, cpuReader CPUReader, driveReader DriveReader) *Controller {
 	return NewController(cfg, hardware, cpuReader, driveReader, slog.New(slog.NewTextHandler(io.Discard, nil)))
 }
@@ -114,7 +125,7 @@ func TestDutyCalculationsSaturateBeforeIntegerConversion(t *testing.T) {
 	driveCfg := DefaultConfig().Drives
 	driveCfg.Kp = math.MaxFloat64
 	driveCfg.Kd = 0
-	result := calculateDriveDuty(50, 0, []DriveReading{{State: DriveActive, Temperature: driveCfg.SetpointC + 1}}, driveCfg, 100)
+	result := calculateDriveDuty(50, 0, []DriveReading{{State: DriveActive, Temperature: driveCfg.SetpointC + 1}}, driveCfg)
 	if result.Duty != driveCfg.Fan.MaxDuty {
 		t.Errorf("drive duty = %d, want maximum %d", result.Duty, driveCfg.Fan.MaxDuty)
 	}
@@ -131,7 +142,7 @@ func TestCalculateDriveDutyMatchesLegacyPDMath(t *testing.T) {
 		{Device: "/dev/sdb", State: DriveActive, Temperature: 38},
 	}
 
-	result := calculateDriveDuty(50, 0, readings, cfg, 100)
+	result := calculateDriveDuty(50, 0, readings, cfg)
 	if result.Mean != 37 || result.Maximum != 38 {
 		t.Errorf("temperatures mean/max = %v/%v, want 37/38", result.Mean, result.Maximum)
 	}
@@ -146,14 +157,14 @@ func TestCalculateDriveDutyMatchesLegacyPDMath(t *testing.T) {
 func TestCalculateDriveDutyHandlesStandbyAndFailure(t *testing.T) {
 	cfg := DefaultConfig().Drives
 
-	standby := calculateDriveDuty(50, 2, []DriveReading{{State: DriveStandby}}, cfg, 100)
+	standby := calculateDriveDuty(50, 2, []DriveReading{{State: DriveStandby}}, cfg)
 	if standby.Duty != cfg.Fan.MinDuty {
 		t.Errorf("standby duty = %d, want %d", standby.Duty, cfg.Fan.MinDuty)
 	}
 
-	failed := calculateDriveDuty(50, 2, []DriveReading{{State: DriveFailed}}, cfg, 100)
-	if failed.Duty != 100 {
-		t.Errorf("failure duty = %d, want 100", failed.Duty)
+	failed := calculateDriveDuty(50, 2, []DriveReading{{State: DriveFailed}}, cfg)
+	if failed.Failed != 1 || failed.Duty != 50 {
+		t.Errorf("failed result = %+v, want one failure and unchanged target 50", failed)
 	}
 }
 
@@ -193,8 +204,8 @@ func TestControllerRestoresModeAndReappliesBothZones(t *testing.T) {
 	hardware.duties[0] = 100
 	hardware.duties[1] = 100
 	controller := newTestController(&cfg, hardware, nil, nil)
-	controller.cpuZone.duty = 30
-	controller.driveZone.duty = 52
+	setZoneState(controller.cpuZone, 30, 30)
+	setZoneState(controller.driveZone, 52, 52)
 
 	if err := controller.ensureManualMode(context.Background()); err != nil {
 		t.Fatal(err)
@@ -217,35 +228,69 @@ func TestControllerModeFailureUsesBothFailureDuties(t *testing.T) {
 		func(context.Context) (float64, string, error) { return 40, "test", nil },
 		func(context.Context, []string) []DriveReading { return nil },
 	)
-	controller.cpuZone.duty = 30
-	controller.driveZone.duty = 50
+	setZoneState(controller.cpuZone, 30, 30)
+	setZoneState(controller.driveZone, 50, 50)
 
 	controller.runCPUCycle(context.Background())
-	if controller.cpuZone.duty != 100 || controller.driveZone.duty != 100 {
-		t.Errorf("cached duties = %d/%d, want 100/100", controller.cpuZone.duty, controller.driveZone.duty)
+	if controller.cpuZone.appliedDuty() != 100 || controller.driveZone.appliedDuty() != 100 {
+		t.Errorf("applied duties = %d/%d, want 100/100", controller.cpuZone.appliedDuty(), controller.driveZone.appliedDuty())
 	}
 	if hardware.duties[0] != 100 || hardware.duties[1] != 100 {
 		t.Errorf("hardware duties = %d/%d, want 100/100", hardware.duties[0], hardware.duties[1])
 	}
 }
 
-func TestControlledZoneCacheChangesOnlyAfterSuccessfulWrite(t *testing.T) {
+func TestControlledZoneWriteFailureUsesFailureDuty(t *testing.T) {
 	hardware := newFakeFanHardware()
 	hardware.failingDuties[60] = true
-	zone := newControlledZone("test", FanConfig{Zone: 1}, 100, hardware, slog.New(slog.NewTextHandler(io.Discard, nil)), &sync.Mutex{})
-	zone.duty = 40
+	zone := newTestZone(hardware, FanConfig{Zone: 1})
+	setZoneState(zone, 40, 40)
 
-	if _, err := zone.set(context.Background(), 60); err == nil {
-		t.Fatal("set() error is nil")
+	if _, err := zone.update(context.Background(), 60, 0); err == nil {
+		t.Fatal("update() error is nil")
 	}
-	if zone.duty != 40 {
-		t.Errorf("duty = %d after failed write, want 40", zone.duty)
+	if zone.appliedDuty() != 100 || hardware.duties[1] != 100 {
+		t.Errorf("failure duty applied/hardware = %d/%d, want 100/100", zone.appliedDuty(), hardware.duties[1])
 	}
-	if _, err := zone.setOrFailSafe(context.Background(), 60); err == nil {
-		t.Fatal("setOrFailSafe() error is nil")
+
+	hardware.failingDuties[100] = true
+	if _, err := zone.update(context.Background(), 60, 0); err == nil {
+		t.Fatal("update() error is nil")
 	}
-	if zone.duty != 100 || hardware.duties[1] != 100 {
-		t.Errorf("failure duty cache/hardware = %d/%d, want 100/100", zone.duty, hardware.duties[1])
+	if zone.appliedDuty() != unknownDuty {
+		t.Errorf("applied duty = %d after failed writes, want unknown", zone.appliedDuty())
+	}
+}
+
+func TestControlledZoneFaultPreservesTarget(t *testing.T) {
+	hardware := newFakeFanHardware()
+	zone := newTestZone(hardware, FanConfig{Zone: 1})
+	ctx := context.Background()
+	if _, err := zone.update(ctx, 45, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := zone.addFault(ctx, faultIPMI, "test"); err != nil {
+		t.Fatal(err)
+	}
+	if err := zone.addFault(ctx, faultSensor, "test"); err != nil {
+		t.Fatal(err)
+	}
+	if hardware.duties[1] != 100 || zone.currentTarget() != 45 {
+		t.Errorf("hardware/target = %d/%d during faults, want 100/45", hardware.duties[1], zone.currentTarget())
+	}
+
+	if err := zone.clearFault(ctx, faultIPMI); err != nil {
+		t.Fatal(err)
+	}
+	if hardware.duties[1] != 100 {
+		t.Errorf("hardware = %d with sensor fault still active, want 100", hardware.duties[1])
+	}
+	if _, err := zone.update(ctx, 47, faultSensor); err != nil {
+		t.Fatal(err)
+	}
+	if hardware.duties[1] != 47 {
+		t.Errorf("hardware = %d after all faults cleared, want 47", hardware.duties[1])
 	}
 }
 
@@ -257,17 +302,17 @@ func TestControllerCPUSensorFailureUsesFailureDuty(t *testing.T) {
 		func(context.Context) (float64, string, error) { return 0, "", errors.New("sensor failed") },
 		nil,
 	)
-	controller.cpuZone.duty = 30
+	setZoneState(controller.cpuZone, 30, 30)
 
 	if err := controller.updateCPU(context.Background()); err == nil {
 		t.Fatal("updateCPU() error is nil")
 	}
-	if controller.cpuZone.duty != 100 || hardware.duties[0] != 100 {
-		t.Errorf("CPU failure duty cache/hardware = %d/%d, want 100/100", controller.cpuZone.duty, hardware.duties[0])
+	if controller.cpuZone.appliedDuty() != 100 || hardware.duties[0] != 100 {
+		t.Errorf("CPU failure duty applied/hardware = %d/%d, want 100/100", controller.cpuZone.appliedDuty(), hardware.duties[0])
 	}
 }
 
-func TestControllerReconcileFailureUsesBothFailureDuties(t *testing.T) {
+func TestControllerReconcileFailureUsesFailureDutiesUntilRecovery(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.Drives.Devices = []string{"/dev/sda"}
 	hardware := newFakeFanHardware()
@@ -275,33 +320,50 @@ func TestControllerReconcileFailureUsesBothFailureDuties(t *testing.T) {
 	hardware.duties[1] = 50
 	hardware.dutyReadErr[0] = errors.New("read failed")
 	controller := newTestController(&cfg, hardware, nil, nil)
-	controller.cpuZone.duty = 30
-	controller.driveZone.duty = 50
+	hardware.mode = cfg.ManualMode
+	controller.readCPU = func(context.Context) (float64, string, error) { return 40, "test", nil }
+	setZoneState(controller.cpuZone, 30, 30)
+	setZoneState(controller.driveZone, 50, 50)
 
-	if err := controller.reconcileDuties(context.Background()); err == nil {
-		t.Fatal("reconcileDuties() error is nil")
+	controller.runCPUCycle(context.Background())
+	if controller.cpuZone.appliedDuty() != 100 || controller.driveZone.appliedDuty() != 100 {
+		t.Errorf("failure duties = %d/%d, want 100/100", controller.cpuZone.appliedDuty(), controller.driveZone.appliedDuty())
 	}
-	if controller.cpuZone.duty != 100 || controller.driveZone.duty != 100 {
-		t.Errorf("failure duties = %d/%d, want 100/100", controller.cpuZone.duty, controller.driveZone.duty)
+	if controller.driveZone.currentTarget() != 50 {
+		t.Errorf("drive target = %d, want preserved 50", controller.driveZone.currentTarget())
+	}
+
+	hardware.dutyReadErr[0] = nil
+	controller.runCPUCycle(context.Background())
+	if hardware.duties[0] != 30 || hardware.duties[1] != 50 {
+		t.Errorf("duties after recovery = %d/%d, want 30/50", hardware.duties[0], hardware.duties[1])
 	}
 }
 
 func TestControlledZoneRPMMismatchUsesFailureDuty(t *testing.T) {
 	hardware := newFakeFanHardware()
 	hardware.rpms["FANA"] = 1000
-	zone := newControlledZone("drive", FanConfig{
+	zone := newTestZone(hardware, FanConfig{
 		Zone: 1,
 		RPMMonitor: RPMMonitorConfig{
 			Enabled: true, Sensor: "FANA", RPMAt30: 600, RPMAt100: 1700,
 		},
-	}, 100, hardware, slog.New(slog.NewTextHandler(io.Discard, nil)), &sync.Mutex{})
-	zone.duty = 20
+	})
+	setZoneState(zone, 20, 20)
 
 	if err := zone.verifyRPM(context.Background(), 0, 0); err == nil {
 		t.Fatal("verifyRPM() error is nil")
 	}
-	if zone.duty != 100 || hardware.duties[1] != 100 {
-		t.Errorf("RPM failure duty cache/hardware = %d/%d, want 100/100", zone.duty, hardware.duties[1])
+	if zone.appliedDuty() != 100 || hardware.duties[1] != 100 {
+		t.Errorf("RPM failure duty applied/hardware = %d/%d, want 100/100", zone.appliedDuty(), hardware.duties[1])
+	}
+
+	hardware.rpms["FANA"] = 1600
+	if err := zone.verifyRPM(context.Background(), 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	if hardware.duties[1] != 20 {
+		t.Errorf("duty after RPM recovery = %d, want target 20", hardware.duties[1])
 	}
 }
 
@@ -313,13 +375,13 @@ func TestControllerRejectsImplausiblyLowCPUTemperature(t *testing.T) {
 		func(context.Context) (float64, string, error) { return 0, "test", nil },
 		nil,
 	)
-	controller.cpuZone.duty = 30
+	setZoneState(controller.cpuZone, 30, 30)
 
 	if err := controller.updateCPU(context.Background()); err == nil {
 		t.Fatal("updateCPU() error is nil")
 	}
-	if controller.cpuZone.currentDuty() != cfg.Safety.FailureDuty {
-		t.Errorf("CPU duty = %d, want %d", controller.cpuZone.currentDuty(), cfg.Safety.FailureDuty)
+	if controller.cpuZone.appliedDuty() != cfg.Safety.FailureDuty {
+		t.Errorf("CPU duty = %d, want %d", controller.cpuZone.appliedDuty(), cfg.Safety.FailureDuty)
 	}
 }
 
@@ -440,5 +502,33 @@ func TestSlowDriveCycleDoesNotBlockCPUCycles(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("controller did not stop")
+	}
+}
+
+func TestControllerDriveFailureKeepsPDTarget(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Drives.Devices = []string{"/dev/sda"}
+	cfg.Drives.Kd = 0
+	hardware := newFakeFanHardware()
+	readings := []DriveReading{{State: DriveFailed, Err: errors.New("timeout")}}
+	controller := newTestController(&cfg, hardware, nil,
+		func(context.Context, []string) []DriveReading { return readings },
+	)
+	setZoneState(controller.driveZone, 50, 50)
+	ctx := context.Background()
+
+	if err := controller.updateDrives(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if hardware.duties[1] != 100 || controller.driveZone.currentTarget() != 50 {
+		t.Errorf("hardware/target = %d/%d after failure, want 100/50", hardware.duties[1], controller.driveZone.currentTarget())
+	}
+
+	readings = []DriveReading{{State: DriveActive, Temperature: cfg.Drives.SetpointC - 1}}
+	if err := controller.updateDrives(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if want := 50 - int(cfg.Drives.Kp); hardware.duties[1] != want {
+		t.Errorf("hardware = %d after recovery, want %d", hardware.duties[1], want)
 	}
 }

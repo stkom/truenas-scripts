@@ -64,73 +64,143 @@ func NewCPUReader(cfg CPUConfig, sensor TemperatureSensor) CPUReader {
 	}
 }
 
+// unknownDuty marks a zone whose hardware duty is uncertain after a failed write.
+const unknownDuty = -1
+
+// zoneFault identifies a condition that overrides a zone's control target with the failure duty.
+type zoneFault uint8
+
+const (
+	faultSensor zoneFault = 1 << iota
+	faultIPMI
+	faultRPM
+)
+
+// controlledZone separates the control algorithm's target from the duty written to hardware.
+// Any active fault writes the failure duty without disturbing the target, so control resumes
+// from its previous state once every fault clears.
 type controlledZone struct {
 	name        string
 	cfg         FanConfig
-	duty        int
 	failureDuty int
 	hardware    FanHardware
 	log         *slog.Logger
 	mutation    *sync.Mutex
-	mu          sync.RWMutex
+
+	mu      sync.Mutex
+	target  int
+	applied int
+	faults  zoneFault
 }
 
 func newControlledZone(name string, cfg FanConfig, failureDuty int, hardware FanHardware, logger *slog.Logger, mutation *sync.Mutex) *controlledZone {
-	return &controlledZone{name: name, cfg: cfg, failureDuty: failureDuty, hardware: hardware, log: logger, mutation: mutation}
+	return &controlledZone{
+		name: name, cfg: cfg, failureDuty: failureDuty, hardware: hardware, log: logger, mutation: mutation,
+		target: cfg.MinDuty, applied: unknownDuty,
+	}
 }
 
-func (zone *controlledZone) set(ctx context.Context, desired int) (bool, error) {
+// update sets the control target, clears the given faults and writes the resulting duty if it changed.
+func (zone *controlledZone) update(ctx context.Context, target int, clear zoneFault) (bool, error) {
 	zone.mu.Lock()
 	defer zone.mu.Unlock()
-	if desired == zone.duty {
+	zone.target = target
+	zone.clearFaultsLocked(clear)
+	return zone.applyLocked(ctx, false)
+}
+
+func (zone *controlledZone) addFault(ctx context.Context, fault zoneFault, reason string) error {
+	zone.mu.Lock()
+	defer zone.mu.Unlock()
+	if zone.faults&fault == 0 {
+		zone.log.Error("using failure duty", "event", "failure_duty", "zone", zone.cfg.Zone, "duty", zone.failureDuty, "reason", reason)
+	}
+	zone.faults |= fault
+	_, err := zone.applyLocked(ctx, false)
+	return err
+}
+
+func (zone *controlledZone) clearFault(ctx context.Context, fault zoneFault) error {
+	zone.mu.Lock()
+	defer zone.mu.Unlock()
+	if zone.faults&fault == 0 {
+		return nil
+	}
+	zone.clearFaultsLocked(fault)
+	_, err := zone.applyLocked(ctx, false)
+	return err
+}
+
+func (zone *controlledZone) clearFaultsLocked(fault zoneFault) {
+	if zone.faults&fault == 0 {
+		return
+	}
+	zone.faults &^= fault
+	if zone.faults == 0 {
+		zone.log.Info("failure duty cleared", "event", "failure_duty_cleared", "zone", zone.cfg.Zone, "target", zone.target)
+	}
+}
+
+func (zone *controlledZone) outputLocked() int {
+	if zone.faults != 0 {
+		return zone.failureDuty
+	}
+	return zone.target
+}
+
+// applyLocked writes the zone output when it differs from the last written duty, or always when forced.
+// A failed write falls back to the failure duty.
+func (zone *controlledZone) applyLocked(ctx context.Context, force bool) (bool, error) {
+	desired := zone.outputLocked()
+	if !force && desired == zone.applied {
 		return false, nil
 	}
-	if err := zone.forceLocked(ctx, desired); err != nil {
-		return false, err
+	err := zone.writeLocked(ctx, desired)
+	if err == nil {
+		return true, nil
 	}
-	return true, nil
+	if desired != zone.failureDuty {
+		zone.log.Error("using failure duty", "event", "failure_duty", "zone", zone.cfg.Zone, "duty", zone.failureDuty, "reason", "fan duty write failure")
+		err = errors.Join(err, zone.writeLocked(ctx, zone.failureDuty))
+	}
+	return false, err
 }
 
-func (zone *controlledZone) force(ctx context.Context, desired int) error {
-	zone.mu.Lock()
-	defer zone.mu.Unlock()
-	return zone.forceLocked(ctx, desired)
-}
-
-func (zone *controlledZone) forceLocked(ctx context.Context, desired int) error {
+func (zone *controlledZone) writeLocked(ctx context.Context, duty int) error {
 	zone.mutation.Lock()
 	defer zone.mutation.Unlock()
-	if err := zone.hardware.SetZoneDuty(ctx, zone.cfg.Zone, desired); err != nil {
-		return fmt.Errorf("error setting %s zone %d duty to %d: %w", zone.name, zone.cfg.Zone, desired, err)
+	if err := zone.hardware.SetZoneDuty(ctx, zone.cfg.Zone, duty); err != nil {
+		zone.applied = unknownDuty
+		return fmt.Errorf("error setting %s zone %d duty to %d: %w", zone.name, zone.cfg.Zone, duty, err)
 	}
-	zone.duty = desired
+	zone.applied = duty
 	return nil
 }
 
-func (zone *controlledZone) currentDuty() int {
-	zone.mu.RLock()
-	defer zone.mu.RUnlock()
-	return zone.duty
+// force writes a duty directly, bypassing the target. Used during startup failure and shutdown.
+func (zone *controlledZone) force(ctx context.Context, duty int) error {
+	zone.mu.Lock()
+	defer zone.mu.Unlock()
+	return zone.writeLocked(ctx, duty)
 }
 
 func (zone *controlledZone) reapply(ctx context.Context) error {
 	zone.mu.Lock()
 	defer zone.mu.Unlock()
-	return zone.forceLocked(ctx, zone.duty)
+	_, err := zone.applyLocked(ctx, true)
+	return err
 }
 
-func (zone *controlledZone) setOrFailSafe(ctx context.Context, desired int) (bool, error) {
-	changed, err := zone.set(ctx, desired)
-	if err == nil {
-		return changed, nil
-	}
-	failureErr := zone.failSafe(ctx, "fan duty write failure")
-	return false, errors.Join(err, failureErr)
+func (zone *controlledZone) currentTarget() int {
+	zone.mu.Lock()
+	defer zone.mu.Unlock()
+	return zone.target
 }
 
-func (zone *controlledZone) failSafe(ctx context.Context, reason string) error {
-	zone.log.Error("using failure duty", "event", "failure_duty", "zone", zone.cfg.Zone, "duty", zone.failureDuty, "reason", reason)
-	return zone.force(ctx, zone.failureDuty)
+func (zone *controlledZone) appliedDuty() int {
+	zone.mu.Lock()
+	defer zone.mu.Unlock()
+	return zone.applied
 }
 
 func (zone *controlledZone) reconcile(ctx context.Context) error {
@@ -140,11 +210,16 @@ func (zone *controlledZone) reconcile(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("error reading %s zone %d duty: %w", zone.name, zone.cfg.Zone, err)
 	}
-	if actual == zone.duty {
+	desired := zone.outputLocked()
+	if actual == desired {
+		zone.applied = actual
 		return nil
 	}
-	zone.log.Warn("fan duty changed externally", "event", "duty_mismatch", "zone", zone.cfg.Zone, "actual", actual, "desired", zone.duty)
-	return zone.forceLocked(ctx, zone.duty)
+	if zone.applied != unknownDuty {
+		zone.log.Warn("fan duty changed externally", "event", "duty_mismatch", "zone", zone.cfg.Zone, "actual", actual, "desired", desired)
+	}
+	_, err = zone.applyLocked(ctx, true)
+	return err
 }
 
 func (zone *controlledZone) verifyRPM(ctx context.Context, retries int, settleTime time.Duration) error {
@@ -153,7 +228,7 @@ func (zone *controlledZone) verifyRPM(ctx context.Context, retries int, settleTi
 		return nil
 	}
 	for attempt := 0; ; attempt++ {
-		duty := zone.currentDuty()
+		duty := zone.appliedDuty()
 		rpm, err := zone.hardware.ReadFanRPM(ctx, monitor.Sensor)
 		if err != nil {
 			return zone.rpmFailure(ctx, fmt.Errorf("error reading %s RPM: %w", monitor.Sensor, err))
@@ -161,7 +236,7 @@ func (zone *controlledZone) verifyRPM(ctx context.Context, retries int, settleTi
 		mismatch, reason := fanRPMMismatch(duty, rpm, monitor)
 		zone.log.Info("fan RPM checked", "event", "rpm_check", "sensor", monitor.Sensor, "rpm", rpm, "duty", duty, "mismatch", mismatch)
 		if !mismatch {
-			return nil
+			return zone.clearFault(ctx, faultRPM)
 		}
 		if attempt >= retries {
 			return zone.rpmFailure(ctx, errors.New(reason))
@@ -177,7 +252,7 @@ func (zone *controlledZone) verifyRPM(ctx context.Context, retries int, settleTi
 }
 
 func (zone *controlledZone) rpmFailure(ctx context.Context, cause error) error {
-	return errors.Join(cause, zone.failSafe(ctx, "fan RPM verification failure"))
+	return errors.Join(cause, zone.addFault(ctx, faultRPM, "fan RPM verification failure"))
 }
 
 type Controller struct {
@@ -270,7 +345,7 @@ func (controller *Controller) runDriveCycle(ctx context.Context) {
 func (controller *Controller) runCPUCycle(ctx context.Context) {
 	if err := controller.ensureManualMode(ctx); err != nil {
 		controller.log.Error("fan mode verification failed", "event", "fan_mode_failed", "error", err)
-		controller.useFailureDuties(ctx, "fan mode verification failure")
+		controller.addFaultToBothZones(ctx, faultIPMI, "fan mode verification failure")
 		return
 	}
 	if err := controller.updateCPU(ctx); err != nil {
@@ -278,7 +353,10 @@ func (controller *Controller) runCPUCycle(ctx context.Context) {
 	}
 	if err := controller.reconcileDuties(ctx); err != nil {
 		controller.log.Error("fan duty reconciliation failed", "event", "duty_reconciliation_failed", "error", err)
+		controller.addFaultToBothZones(ctx, faultIPMI, "fan duty reconciliation failure")
+		return
 	}
+	controller.clearFaultFromBothZones(ctx, faultIPMI)
 }
 
 func (controller *Controller) start(ctx context.Context) error {
@@ -296,18 +374,18 @@ func (controller *Controller) start(ctx context.Context) error {
 		}
 	}
 
-	if err := controller.cpuZone.force(ctx, clampDuty(controller.cfg.InitialDuty, controller.cfg.CPU.Fan)); err != nil {
+	if _, err := controller.cpuZone.update(ctx, clampDuty(controller.cfg.InitialDuty, controller.cfg.CPU.Fan), 0); err != nil {
 		return controller.startFailure(ctx, fmt.Errorf("error setting initial CPU duty: %w", err))
 	}
-	if err := controller.driveZone.force(ctx, clampDuty(controller.cfg.InitialDuty, controller.cfg.Drives.Fan)); err != nil {
+	if _, err := controller.driveZone.update(ctx, clampDuty(controller.cfg.InitialDuty, controller.cfg.Drives.Fan), 0); err != nil {
 		return controller.startFailure(ctx, fmt.Errorf("error setting initial drive duty: %w", err))
 	}
 	controller.log.Info("fan controller started",
 		"event", "startup_completed",
 		"old_mode", controller.oldMode,
 		"manual_mode", controller.cfg.ManualMode,
-		"cpu_duty", controller.cpuZone.currentDuty(),
-		"drive_duty", controller.driveZone.currentDuty(),
+		"cpu_duty", controller.cpuZone.appliedDuty(),
+		"drive_duty", controller.driveZone.appliedDuty(),
 		"drive_count", len(controller.cfg.Drives.Devices),
 	)
 	return nil
@@ -316,8 +394,8 @@ func (controller *Controller) start(ctx context.Context) error {
 func (controller *Controller) startFailure(ctx context.Context, cause error) error {
 	return errors.Join(
 		cause,
-		controller.cpuZone.failSafe(ctx, "startup"),
-		controller.driveZone.failSafe(ctx, "startup"),
+		controller.cpuZone.force(ctx, controller.cfg.Safety.FailureDuty),
+		controller.driveZone.force(ctx, controller.cfg.Safety.FailureDuty),
 	)
 }
 
@@ -372,12 +450,10 @@ func (controller *Controller) reconcileDuties(ctx context.Context) error {
 	if !controller.cfg.ReadDuty {
 		return nil
 	}
-	cpuErr := controller.cpuZone.reconcile(ctx)
-	driveErr := controller.driveZone.reconcile(ctx)
-	if cpuErr != nil || driveErr != nil {
-		controller.useFailureDuties(ctx, "fan duty reconciliation failure")
-	}
-	return errors.Join(cpuErr, driveErr)
+	return errors.Join(
+		controller.cpuZone.reconcile(ctx),
+		controller.driveZone.reconcile(ctx),
+	)
 }
 
 func (controller *Controller) updateCPU(ctx context.Context) error {
@@ -386,10 +462,10 @@ func (controller *Controller) updateCPU(ctx context.Context) error {
 		err = fmt.Errorf("CPU reader returned invalid temperature %.1f", temperature)
 	}
 	if err != nil {
-		return errors.Join(err, controller.cpuZone.failSafe(ctx, "CPU sensor failure"))
+		return errors.Join(err, controller.cpuZone.addFault(ctx, faultSensor, "CPU sensor failure"))
 	}
 	duty := calculateCPUDuty(temperature, controller.cfg.CPU)
-	changed, err := controller.cpuZone.setOrFailSafe(ctx, duty)
+	changed, err := controller.cpuZone.update(ctx, duty, faultSensor)
 	if err != nil {
 		return err
 	}
@@ -406,14 +482,20 @@ func (controller *Controller) updateDrives(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	result := calculateDriveDuty(controller.driveZone.currentDuty(), controller.driveErr, readings, controller.cfg.Drives, controller.cfg.Safety.FailureDuty)
+	result := calculateDriveDuty(controller.driveZone.currentTarget(), controller.driveErr, readings, controller.cfg.Drives)
 	controller.logDriveIssues(readings)
 	if result.Failed > 0 || result.Active == 0 {
 		controller.driveErr = 0
 	} else {
 		controller.driveErr = result.Error
 	}
-	if _, err := controller.driveZone.setOrFailSafe(ctx, result.Duty); err != nil {
+	var err error
+	if result.Failed > 0 {
+		err = controller.driveZone.addFault(ctx, faultSensor, "drive sensor failure")
+	} else {
+		_, err = controller.driveZone.update(ctx, result.Duty, faultSensor)
+	}
+	if err != nil {
 		return err
 	}
 	controller.log.Info("drive fans updated",
@@ -426,7 +508,8 @@ func (controller *Controller) updateDrives(ctx context.Context) error {
 		"error", result.Error,
 		"proportional", result.Proportional,
 		"derivative", result.Derivative,
-		"duty", result.Duty,
+		"target", controller.driveZone.currentTarget(),
+		"duty", controller.driveZone.appliedDuty(),
 	)
 	return nil
 }
@@ -442,12 +525,19 @@ func (controller *Controller) logDriveIssues(readings []DriveReading) {
 	}
 }
 
-func (controller *Controller) useFailureDuties(ctx context.Context, reason string) {
-	if err := controller.cpuZone.failSafe(ctx, reason); err != nil {
-		controller.log.Error("CPU failure duty failed", "event", "failure_duty_failed", "zone", controller.cfg.CPU.Fan.Zone, "error", err)
+func (controller *Controller) addFaultToBothZones(ctx context.Context, fault zoneFault, reason string) {
+	for _, zone := range []*controlledZone{controller.cpuZone, controller.driveZone} {
+		if err := zone.addFault(ctx, fault, reason); err != nil {
+			controller.log.Error("failure duty failed", "event", "failure_duty_failed", "zone", zone.cfg.Zone, "error", err)
+		}
 	}
-	if err := controller.driveZone.failSafe(ctx, reason); err != nil {
-		controller.log.Error("drive failure duty failed", "event", "failure_duty_failed", "zone", controller.cfg.Drives.Fan.Zone, "error", err)
+}
+
+func (controller *Controller) clearFaultFromBothZones(ctx context.Context, fault zoneFault) {
+	for _, zone := range []*controlledZone{controller.cpuZone, controller.driveZone} {
+		if err := zone.clearFault(ctx, fault); err != nil {
+			controller.log.Error("fan duty restore failed", "event", "duty_restore_failed", "zone", zone.cfg.Zone, "error", err)
+		}
 	}
 }
 
@@ -465,6 +555,9 @@ func (controller *Controller) verifyFanRPMs(ctx context.Context) error {
 }
 
 func fanRPMMismatch(duty int, rpm float64, monitor RPMMonitorConfig) (bool, string) {
+	if duty < 0 {
+		return true, "fan duty is unknown"
+	}
 	if math.IsNaN(rpm) {
 		return true, "RPM is not a number"
 	}
@@ -507,8 +600,10 @@ func calculateCPUDuty(temperature float64, cfg CPUConfig) int {
 	return clampFloatDuty(math.Ceil(demand), cfg.Fan)
 }
 
-func calculateDriveDuty(current int, previousError float64, readings []DriveReading, cfg DriveConfig, failureDuty int) DriveControlResult {
-	result := DriveControlResult{}
+// calculateDriveDuty applies the legacy spinpid2 PD step to the current target duty.
+// When any reading failed, Duty is left at the current target; the caller applies the failure duty.
+func calculateDriveDuty(current int, previousError float64, readings []DriveReading, cfg DriveConfig) DriveControlResult {
+	result := DriveControlResult{Duty: current}
 	var temperatures []float64
 	for _, reading := range readings {
 		switch reading.State {
@@ -522,7 +617,6 @@ func calculateDriveDuty(current int, previousError float64, readings []DriveRead
 		}
 	}
 	if result.Failed > 0 {
-		result.Duty = failureDuty
 		return result
 	}
 	if len(temperatures) == 0 {
